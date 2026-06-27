@@ -288,3 +288,12 @@ For the interactive notebook, use Jupyter (possible in VS Code).
 | Manual annotation, testing | 2 |
 | Optimization, cleanup, documentation | 3 |
 | | |
+
+## Author and acknowledgement
+Code originally written by: Iva Švecová (iva.svecova@iem.cas.cz)
+
+Remember:
+All publications resulting from the use of instruments and support staff within the MSC IEM facility should acknowledge the facility, and the facility should be informed of the publication.
+Assistance provided above the technical or routine level, with any facility staff providing scientific input and expertise in experimental set-up, acquisition, analysis or writing, should be recognized through co-authorship on resulting publications. Please discuss authorship and acknowledgement with facility staff prior to manuscript submission.
+More information here: https://www.iem.cas.cz/en/department/microscopy-service-centre/#acknowledgement
+
