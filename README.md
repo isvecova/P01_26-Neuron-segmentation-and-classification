@@ -20,13 +20,29 @@ Prerequisites:
 - Input data accessible at configured paths.
 
 
+### `.src\03_classification\prepare_features_for_classifier.py`
+Python script extracting cell measurements for the red channel into one `.csv`(`red_channel_df.csv`), that is then subsequently used for classifier training and prediction
+
+Prerequisites:
+- Features extracted using the feature extraction script and saved as one `.csv` per image in the `histograms` folder
+- Python packages: `pandas`
+
+
 ### `.src\03_classification\classification_model_training.ipynb`
 Jupyter notebook for interactive data loading, model training and result visualization. 
 Prerequisites:
 - Python packages: `bioio`, `napari`, `numpy`, `pandas`, `skimage`, `sklearn`,`tifffile`.
 - Input data accessible at configured paths.
 
+
+### `.src\03_classification\summarize_classifications.ipynb`
+Jupyter notebook that produces an overview table of classifications per image from the classifier results. 
+
+Prerequisites:
+- Classification output stored in `.\classification\output\props_with_predictions.csv`
+- Python packages: `pandas`
 ---
+
 
 # AT8 Neuron segmentation workflow
 
@@ -287,6 +303,7 @@ For the interactive notebook, use Jupyter (possible in VS Code).
 | Clustering, preparation of classification scripts | 6 |
 | Manual annotation, testing | 2 |
 | Optimization, cleanup, documentation | 3 |
+| Discussion, script adjustment for classification summary | 3 |
 | | |
 
 ## Author and acknowledgement
@@ -297,3 +314,6 @@ All publications resulting from the use of instruments and support staff within 
 Assistance provided above the technical or routine level, with any facility staff providing scientific input and expertise in experimental set-up, acquisition, analysis or writing, should be recognized through co-authorship on resulting publications. Please discuss authorship and acknowledgement with facility staff prior to manuscript submission.
 More information here: https://www.iem.cas.cz/en/department/microscopy-service-centre/#acknowledgement
 
+
+## Changelog
+- 2026-06-29: Added `prepare_features_for_classifier.py` for combining feature tables into one for classifier and `summarize_classifications.ipynb` for producing the summary table for red measurements. 
