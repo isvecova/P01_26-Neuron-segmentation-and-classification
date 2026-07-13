@@ -1,0 +1,447 @@
+#!/usr/bin/env python3
+"""
+ANIMAL-LEVEL GROUP SUMMARY, STATISTICS, AND BOXPLOTS
+
+This script reads:
+    all_images_sample_summary.csv
+
+It:
+1. Extracts animal_id as everything before the first underscore.
+2. Detects one of these groups anywhere in the filename:
+       WT+PLA
+       WT+Cykla
+       P301S+Cykla
+       P301S+PLA
+3. Averages all samples/images belonging to the same animal.
+4. Uses the ANIMAL, not the image or cell, as the independent experimental unit.
+5. Produces one boxplot per metric with individual animal points.
+6. Runs:
+       - overall Kruskal-Wallis test across the four groups
+       - pairwise two-sided Mann-Whitney U tests
+       - Holm correction across all six pairwise comparisons
+7. Writes animal-level values and statistics to CSV files.
+
+Install:
+    pip install numpy pandas scipy matplotlib
+
+Run:
+    Edit SETTINGS below and run from the IDE/editor.
+"""
+
+from __future__ import annotations
+
+from itertools import combinations
+from pathlib import Path
+from typing import Dict, List
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from scipy import stats
+
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+INPUT_CSV = Path(
+    r"L:\Algernon\530\Sarah\puncta_analysis_260713\all_images_sample_summary.csv"
+)
+OUTPUT_ROOT = Path(
+    r"L:\Algernon\530\Sarah\puncta_analysis_260713\animal_group_statistics"
+)
+
+GROUP_ORDER = [
+    "WT+PLA",
+    "WT+Cykla",
+    "P301S+PLA",
+    "P301S+Cykla",
+]
+
+# Metrics to analyze. Remove or add columns as needed.
+METRICS = [
+    "mean_synaptophysin_count_per_neun",
+    "mean_psd95_count_per_neun",
+    "mean_colocalized_pairs_per_neun",
+    "mean_synaptophysin_density_per_100_um3",
+    "mean_psd95_density_per_100_um3",
+    "mean_colocalized_density_per_100_um3",
+    "mean_fraction_synaptophysin_paired",
+    "mean_fraction_psd95_paired",
+]
+
+# Plot settings.
+FIGURE_WIDTH = 7
+FIGURE_HEIGHT = 6
+DPI = 200
+SHOW_ALL_PAIRWISE_P_VALUES = False
+ANNOTATE_SIGNIFICANT_ONLY = True
+ALPHA = 0.05
+
+# Reproducible horizontal jitter for individual animal points.
+RANDOM_SEED = 12345
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def parse_group(file_name: str) -> str:
+    """
+    Detect group names anywhere in the filename.
+
+    Matching longer/more specific names first prevents accidental ambiguity.
+    """
+    normalized = file_name.lower()
+
+    lookup = {
+        "WT+PLA": ["wt+pla", "wt_pla", "wt-pla"],
+        "WT+Cykla": ["wt+cykla", "wt_cykla", "wt-cykla"],
+        "P301S+PLA": ["p301s+pla", "p301s_pla", "p301s-pla"],
+        "P301S+Cykla": ["p301s+cykla", "p301s_cykla", "p301s-cykla"],
+    }
+
+    matches = []
+    for group, variants in lookup.items():
+        if any(v in normalized for v in variants):
+            matches.append(group)
+
+    if len(matches) == 0:
+        raise ValueError(f"No recognized group found in filename: {file_name}")
+    if len(matches) > 1:
+        raise ValueError(f"Multiple groups found in filename: {file_name}: {matches}")
+
+    return matches[0]
+
+
+def holm_adjust(p_values: List[float]) -> List[float]:
+    """
+    Holm step-down family-wise error correction.
+    """
+    p = np.asarray(p_values, dtype=float)
+    n = len(p)
+
+    order = np.argsort(p)
+    sorted_p = p[order]
+    adjusted_sorted = np.empty(n, dtype=float)
+
+    running_max = 0.0
+    for rank, value in enumerate(sorted_p):
+        adjusted = (n - rank) * value
+        running_max = max(running_max, adjusted)
+        adjusted_sorted[rank] = min(running_max, 1.0)
+
+    adjusted = np.empty(n, dtype=float)
+    adjusted[order] = adjusted_sorted
+    return adjusted.tolist()
+
+
+def p_to_stars(p: float) -> str:
+    if not np.isfinite(p):
+        return "n/a"
+    if p < 0.0001:
+        return "****"
+    if p < 0.001:
+        return "***"
+    if p < 0.01:
+        return "**"
+    if p < 0.05:
+        return "*"
+    return "ns"
+
+
+def prepare_animal_level_data(df: pd.DataFrame) -> pd.DataFrame:
+    if "file_name" not in df.columns:
+        raise ValueError("Input CSV must contain a 'file_name' column.")
+
+    df = df.copy()
+    df["animal_id"] = df["file_name"].astype(str).str.split("_", n=1).str[0]
+    df["group"] = df["file_name"].astype(str).apply(parse_group)
+
+    # Verify that every animal belongs to only one group.
+    group_count = df.groupby("animal_id")["group"].nunique()
+    invalid = group_count[group_count > 1]
+    if not invalid.empty:
+        raise ValueError(
+            "The following animal IDs occur in more than one group: "
+            + ", ".join(invalid.index.astype(str))
+        )
+
+    available_metrics = [metric for metric in METRICS if metric in df.columns]
+    missing_metrics = [metric for metric in METRICS if metric not in df.columns]
+
+    if missing_metrics:
+        print("Warning: these requested metrics are absent and will be skipped:")
+        for metric in missing_metrics:
+            print(f"  - {metric}")
+
+    if not available_metrics:
+        raise ValueError("None of the requested METRICS exist in the input CSV.")
+
+    # Each animal contributes one value per metric: mean across its images/samples.
+    animal = (
+        df.groupby(["animal_id", "group"], as_index=False)[available_metrics]
+        .mean(numeric_only=True)
+    )
+    return animal
+
+
+def run_statistics(animal: pd.DataFrame, metric: str):
+    groups = {}
+    for group in GROUP_ORDER:
+        values = animal.loc[animal["group"] == group, metric].dropna().to_numpy(dtype=float)
+        groups[group] = values
+
+    nonempty = [values for values in groups.values() if len(values) > 0]
+
+    if len(nonempty) >= 2:
+        try:
+            kw = stats.kruskal(*nonempty, nan_policy="omit")
+            kw_h = float(kw.statistic)
+            kw_p = float(kw.pvalue)
+        except ValueError:
+            kw_h = np.nan
+            kw_p = np.nan
+    else:
+        kw_h = np.nan
+        kw_p = np.nan
+
+    pairwise_rows = []
+    raw_p = []
+
+    for group_a, group_b in combinations(GROUP_ORDER, 2):
+        a = groups[group_a]
+        b = groups[group_b]
+
+        if len(a) > 0 and len(b) > 0:
+            result = stats.mannwhitneyu(a, b, alternative="two-sided", method="auto")
+            u = float(result.statistic)
+            p = float(result.pvalue)
+        else:
+            u = np.nan
+            p = np.nan
+
+        pairwise_rows.append({
+            "metric": metric,
+            "group_a": group_a,
+            "group_b": group_b,
+            "n_a": len(a),
+            "n_b": len(b),
+            "mann_whitney_u": u,
+            "p_raw": p,
+        })
+        raw_p.append(p)
+
+    finite_indices = [i for i, p in enumerate(raw_p) if np.isfinite(p)]
+    finite_adjusted = holm_adjust([raw_p[i] for i in finite_indices])
+
+    adjusted = [np.nan] * len(raw_p)
+    for index, value in zip(finite_indices, finite_adjusted):
+        adjusted[index] = value
+
+    for row, p_adj in zip(pairwise_rows, adjusted):
+        row["p_holm"] = p_adj
+        row["significance"] = p_to_stars(p_adj)
+
+    overall_row = {
+        "metric": metric,
+        "test": "Kruskal-Wallis",
+        "number_of_groups_with_data": len(nonempty),
+        "H_statistic": kw_h,
+        "p_value": kw_p,
+        "significance": p_to_stars(kw_p),
+    }
+
+    return groups, overall_row, pairwise_rows
+
+
+def add_significance_annotations(
+    ax,
+    pairwise: pd.DataFrame,
+    group_positions: Dict[str, int],
+    y_values: np.ndarray,
+) -> None:
+    rows = pairwise.copy()
+
+    if ANNOTATE_SIGNIFICANT_ONLY:
+        rows = rows[rows["p_holm"] < ALPHA]
+    elif not SHOW_ALL_PAIRWISE_P_VALUES:
+        return
+
+    rows = rows[np.isfinite(rows["p_holm"])]
+    if rows.empty:
+        return
+
+    finite_y = y_values[np.isfinite(y_values)]
+    if finite_y.size == 0:
+        return
+
+    y_min = float(np.min(finite_y))
+    y_max = float(np.max(finite_y))
+    span = y_max - y_min
+    if span == 0:
+        span = max(abs(y_max), 1.0)
+
+    base = y_max + 0.10 * span
+    step = 0.10 * span
+
+    for level, (_, row) in enumerate(rows.iterrows()):
+        x1 = group_positions[row["group_a"]]
+        x2 = group_positions[row["group_b"]]
+        y = base + level * step
+        h = 0.025 * span
+
+        ax.plot([x1, x1, x2, x2], [y, y + h, y + h, y], linewidth=1)
+        label = (
+            row["significance"]
+            if ANNOTATE_SIGNIFICANT_ONLY
+            else f"p={row['p_holm']:.3g}"
+        )
+        ax.text((x1 + x2) / 2, y + h, label, ha="center", va="bottom", fontsize=9)
+
+    ax.set_ylim(top=base + (len(rows) + 1) * step)
+
+
+def make_boxplot(
+    animal: pd.DataFrame,
+    metric: str,
+    overall_row: Dict,
+    pairwise_rows: List[Dict],
+    output_path: Path,
+) -> None:
+    rng = np.random.default_rng(RANDOM_SEED)
+
+    data = [
+        animal.loc[animal["group"] == group, metric].dropna().to_numpy(dtype=float)
+        for group in GROUP_ORDER
+    ]
+
+    fig, ax = plt.subplots(figsize=(FIGURE_WIDTH, FIGURE_HEIGHT))
+
+    ax.boxplot(
+        data,
+        positions=np.arange(1, len(GROUP_ORDER) + 1),
+        widths=0.55,
+        patch_artist=False,
+        showfliers=False,
+        medianprops={"linewidth": 1.5},
+    )
+
+    all_y = []
+
+    for position, (group, values) in enumerate(zip(GROUP_ORDER, data), start=1):
+        if len(values) == 0:
+            continue
+
+        jitter = rng.normal(loc=0.0, scale=0.055, size=len(values))
+        ax.scatter(
+            np.full(len(values), position) + jitter,
+            values,
+            s=35,
+            alpha=0.85,
+            zorder=3,
+        )
+        all_y.extend(values.tolist())
+
+        # Show n directly under each group.
+        ax.text(
+            position,
+            0.01,
+            f"n={len(values)}",
+            transform=ax.get_xaxis_transform(),
+            ha="center",
+            va="bottom",
+            fontsize=8,
+        )
+
+    ax.set_xticks(np.arange(1, len(GROUP_ORDER) + 1))
+    ax.set_xticklabels(GROUP_ORDER, rotation=20, ha="right")
+    ax.set_ylabel(metric.replace("_", " "))
+    ax.set_title(
+        f"{metric.replace('_', ' ')}\n"
+        f"Kruskal-Wallis p={overall_row['p_value']:.3g}"
+        if np.isfinite(overall_row["p_value"])
+        else f"{metric.replace('_', ' ')}\nKruskal-Wallis unavailable"
+    )
+
+    pairwise_df = pd.DataFrame(pairwise_rows)
+    positions = {group: index for index, group in enumerate(GROUP_ORDER, start=1)}
+    add_significance_annotations(
+        ax,
+        pairwise_df,
+        positions,
+        np.asarray(all_y, dtype=float),
+    )
+
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def main() -> None:
+    if not INPUT_CSV.exists():
+        raise FileNotFoundError(f"INPUT_CSV does not exist: {INPUT_CSV}")
+
+    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+
+    sample = pd.read_csv(INPUT_CSV)
+    animal = prepare_animal_level_data(sample)
+    animal.to_csv(OUTPUT_ROOT / "animal_level_means.csv", index=False)
+
+    metrics = [
+        metric for metric in METRICS
+        if metric in animal.columns
+    ]
+
+    overall_rows = []
+    pairwise_rows_all = []
+
+    for metric in metrics:
+        _, overall_row, pairwise_rows = run_statistics(animal, metric)
+        overall_rows.append(overall_row)
+        pairwise_rows_all.extend(pairwise_rows)
+
+        make_boxplot(
+            animal,
+            metric,
+            overall_row,
+            pairwise_rows,
+            OUTPUT_ROOT / f"{metric}_boxplot.png",
+        )
+
+    pd.DataFrame(overall_rows).to_csv(
+        OUTPUT_ROOT / "overall_kruskal_wallis.csv",
+        index=False,
+    )
+    pd.DataFrame(pairwise_rows_all).to_csv(
+        OUTPUT_ROOT / "pairwise_mann_whitney_holm.csv",
+        index=False,
+    )
+
+    group_summary_rows = []
+    for metric in metrics:
+        for group in GROUP_ORDER:
+            values = animal.loc[animal["group"] == group, metric].dropna()
+            group_summary_rows.append({
+                "metric": metric,
+                "group": group,
+                "n_animals": int(values.shape[0]),
+                "mean": float(values.mean()) if len(values) else np.nan,
+                "sd": float(values.std(ddof=1)) if len(values) > 1 else np.nan,
+                "median": float(values.median()) if len(values) else np.nan,
+                "q1": float(values.quantile(0.25)) if len(values) else np.nan,
+                "q3": float(values.quantile(0.75)) if len(values) else np.nan,
+            })
+
+    pd.DataFrame(group_summary_rows).to_csv(
+        OUTPUT_ROOT / "group_descriptive_statistics.csv",
+        index=False,
+    )
+
+    print(f"Animal-level data and plots saved to: {OUTPUT_ROOT}")
+
+
+if __name__ == "__main__":
+    main()
