@@ -1,0 +1,443 @@
+#!/usr/bin/env python3
+"""
+Interactive puncta-parameter explorer.
+
+Loads one .ims image and its already-created NeuN 3D label mask, then lets you
+adjust these parameters with live sliders:
+
+    SHELL_OUTER_UM
+    SYNAPTOPHYSIN_THRESHOLD_MULTIPLIER
+    PSD95_THRESHOLD_MULTIPLIER
+    MIN_PUNCTUM_VOLUME_UM3
+    MAX_PUNCTUM_VOLUME_UM3
+    COLOCALIZATION_MAX_DISTANCE_UM
+
+Channel order:
+    0 = DAPI
+    1 = NeuN
+    2 = Synaptophysin
+    3 = PSD95
+
+Display colors:
+    green   = segmented NeuN boundaries
+    red     = Synaptophysin-positive puncta
+    magenta = PSD95-positive puncta
+    yellow  = matched Synaptophysin–PSD95 pairs
+
+Controls:
+    - Move sliders: analysis updates live.
+    - Use the Z slider to inspect individual optical sections.
+    - Click "Save settings" to write puncta_parameters.json.
+    - The batch-analysis script can load that JSON automatically.
+
+Install:
+    pip install numpy pandas scipy scikit-image tifffile matplotlib bioio
+
+Edit the SETTINGS section, then run this script from your IDE.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Dict, Tuple
+
+import matplotlib.pyplot as plt
+from matplotlib.widgets import Button, Slider
+import numpy as np
+import pandas as pd
+import tifffile
+from bioio import BioImage
+from scipy.ndimage import distance_transform_edt
+from scipy.optimize import linear_sum_assignment
+from skimage import exposure, filters, measure, morphology
+
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+IMS_FILE = Path(r"D:\path\to\representative_image.ims")
+MASK_FILE = Path(r"L:\path\to\representative_image_mask_3d.tif")
+
+SCENE_INDEX = 2
+
+DAPI_CHANNEL = 0
+NEUN_CHANNEL = 1
+SYNAPTOPHYSIN_CHANNEL = 2
+PSD95_CHANNEL = 3
+
+BACKGROUND_SIGMA_UM = 0.8
+SMOOTH_SIGMA_UM = 0.15
+
+INITIAL_PARAMETERS = {
+    "SHELL_OUTER_UM": 5.0,
+    "SYNAPTOPHYSIN_THRESHOLD_MULTIPLIER": 1.0,
+    "PSD95_THRESHOLD_MULTIPLIER": 1.0,
+    "MIN_PUNCTUM_VOLUME_UM3": 0.003,
+    "MAX_PUNCTUM_VOLUME_UM3": 1.0,
+    "COLOCALIZATION_MAX_DISTANCE_UM": 0.5,
+}
+
+OUTPUT_JSON = Path(__file__).with_name("puncta_parameters.json")
+
+
+# ============================================================
+# IMAGE AND DETECTION HELPERS
+# ============================================================
+
+def robust_rescale(volume: np.ndarray) -> np.ndarray:
+    finite = volume[np.isfinite(volume)]
+    if finite.size == 0:
+        return np.zeros_like(volume, dtype=np.float32)
+    lo, hi = np.percentile(finite, (0.2, 99.8))
+    if hi <= lo:
+        return np.zeros_like(volume, dtype=np.float32)
+    return exposure.rescale_intensity(
+        volume, in_range=(lo, hi), out_range=(0.0, 1.0)
+    ).astype(np.float32)
+
+
+def get_voxel_size_um(image: BioImage) -> Tuple[float, float, float]:
+    px = image.metadata.images[0].pixels
+    x = float(px.physical_size_x) if px.physical_size_x is not None else np.nan
+    y = float(px.physical_size_y) if px.physical_size_y is not None else x
+    z = float(px.physical_size_z) if px.physical_size_z is not None else np.nan
+
+    if not np.isfinite(x) or not np.isfinite(y):
+        raise ValueError("Missing XY pixel size in image metadata.")
+    if not np.isfinite(z):
+        print("WARNING: missing Z spacing; using X spacing for Z.")
+        z = x
+    return z, y, x
+
+
+def load_data():
+    bio = BioImage(str(IMS_FILE))
+    bio.set_scene(bio.scenes[SCENE_INDEX])
+    spacing = get_voxel_size_um(bio)
+
+    neun = np.asarray(
+        bio.get_image_data("ZYX", C=NEUN_CHANNEL, T=0), dtype=np.float32
+    )
+    syp = np.asarray(
+        bio.get_image_data("ZYX", C=SYNAPTOPHYSIN_CHANNEL, T=0), dtype=np.float32
+    )
+    psd = np.asarray(
+        bio.get_image_data("ZYX", C=PSD95_CHANNEL, T=0), dtype=np.float32
+    )
+    mask = tifffile.imread(MASK_FILE).astype(np.int32)
+
+    if mask.shape != neun.shape:
+        raise ValueError(
+            f"Mask/image mismatch: mask={mask.shape}, image={neun.shape}. "
+            "Use the same scene and scaling as the segmentation script."
+        )
+    return neun, syp, psd, mask, spacing
+
+
+def sigma_pixels(sigma_um: float, spacing: Tuple[float, float, float]):
+    return tuple(float(sigma_um / step) for step in spacing)
+
+
+def preprocess_channel(
+    volume: np.ndarray,
+    spacing: Tuple[float, float, float],
+) -> np.ndarray:
+    image = robust_rescale(volume)
+    background = filters.gaussian(
+        image,
+        sigma=sigma_pixels(BACKGROUND_SIGMA_UM, spacing),
+        preserve_range=True,
+    )
+    enhanced = np.clip(image - background, 0, None)
+
+    if SMOOTH_SIGMA_UM > 0:
+        enhanced = filters.gaussian(
+            enhanced,
+            sigma=sigma_pixels(SMOOTH_SIGMA_UM, spacing),
+            preserve_range=True,
+        )
+    return enhanced.astype(np.float32)
+
+
+def detect_from_enhanced(
+    enhanced: np.ndarray,
+    spacing: Tuple[float, float, float],
+    threshold_multiplier: float,
+    min_volume_um3: float,
+    max_volume_um3: float,
+):
+    positive = enhanced[enhanced > 0]
+    if positive.size == 0:
+        return np.zeros_like(enhanced, dtype=np.int32), np.nan
+
+    threshold = float(filters.threshold_otsu(positive) * threshold_multiplier)
+    binary = enhanced > threshold
+    labels = measure.label(binary, connectivity=3)
+
+    voxel_volume = float(np.prod(spacing))
+    keep = np.zeros_like(binary, dtype=bool)
+
+    for region in measure.regionprops(labels):
+        object_volume = region.area * voxel_volume
+        if min_volume_um3 <= object_volume <= max_volume_um3:
+            keep[labels == region.label] = True
+
+    return measure.label(keep, connectivity=3).astype(np.int32), threshold
+
+
+def make_union_shell(
+    neun_labels: np.ndarray,
+    spacing: Tuple[float, float, float],
+    outer_um: float,
+):
+    all_neun = neun_labels > 0
+    distance = distance_transform_edt(~all_neun, sampling=spacing)
+    return (distance > 0) & (distance <= outer_um) & (~all_neun)
+
+
+def centroid_table_in_mask(
+    labels: np.ndarray,
+    analysis_mask: np.ndarray,
+    spacing: Tuple[float, float, float],
+):
+    rows = []
+    shape = labels.shape
+    voxel_volume = float(np.prod(spacing))
+
+    for region in measure.regionprops(labels):
+        z, y, x = region.centroid
+        zi = int(np.clip(round(z), 0, shape[0] - 1))
+        yi = int(np.clip(round(y), 0, shape[1] - 1))
+        xi = int(np.clip(round(x), 0, shape[2] - 1))
+
+        if analysis_mask[zi, yi, xi]:
+            rows.append({
+                "object_id": int(region.label),
+                "z_px": float(z),
+                "y_px": float(y),
+                "x_px": float(x),
+                "z_um": float(z * spacing[0]),
+                "y_um": float(y * spacing[1]),
+                "x_um": float(x * spacing[2]),
+                "volume_um3": float(region.area * voxel_volume),
+            })
+    return pd.DataFrame(rows)
+
+
+def match_pairs(syp: pd.DataFrame, psd: pd.DataFrame, max_distance_um: float):
+    columns = [
+        "syp_id", "psd_id", "distance_um",
+        "midpoint_z_px", "midpoint_y_px", "midpoint_x_px"
+    ]
+    if syp.empty or psd.empty:
+        return pd.DataFrame(columns=columns)
+
+    a = syp[["z_um", "y_um", "x_um"]].to_numpy()
+    b = psd[["z_um", "y_um", "x_um"]].to_numpy()
+    distances = np.sqrt(((a[:, None, :] - b[None, :, :]) ** 2).sum(axis=2))
+    rows_i, cols_j = linear_sum_assignment(distances)
+
+    rows = []
+    for i, j in zip(rows_i, cols_j):
+        d = float(distances[i, j])
+        if d <= max_distance_um:
+            rows.append({
+                "syp_id": int(syp.iloc[i]["object_id"]),
+                "psd_id": int(psd.iloc[j]["object_id"]),
+                "distance_um": d,
+                "midpoint_z_px": float((syp.iloc[i]["z_px"] + psd.iloc[j]["z_px"]) / 2),
+                "midpoint_y_px": float((syp.iloc[i]["y_px"] + psd.iloc[j]["y_px"]) / 2),
+                "midpoint_x_px": float((syp.iloc[i]["x_px"] + psd.iloc[j]["x_px"]) / 2),
+            })
+    return pd.DataFrame(rows, columns=columns)
+
+
+# ============================================================
+# INTERACTIVE VIEWER
+# ============================================================
+
+def main():
+    neun, syp_raw, psd_raw, neun_labels, spacing = load_data()
+
+    print("Preprocessing channels once...")
+    syp_enhanced = preprocess_channel(syp_raw, spacing)
+    psd_enhanced = preprocess_channel(psd_raw, spacing)
+    neun_display = robust_rescale(neun)
+
+    state: Dict[str, object] = {}
+
+    fig, ax = plt.subplots(figsize=(12, 9))
+    plt.subplots_adjust(left=0.10, right=0.98, top=0.92, bottom=0.40)
+
+    z0 = neun.shape[0] // 2
+
+    slider_specs = [
+        ("Z_SLICE", 0, neun.shape[0] - 1, z0, 1),
+        ("SHELL_OUTER_UM", 1.0, 10.0, INITIAL_PARAMETERS["SHELL_OUTER_UM"], 0.1),
+        ("SYNAPTOPHYSIN_THRESHOLD_MULTIPLIER", 0.4, 2.0,
+         INITIAL_PARAMETERS["SYNAPTOPHYSIN_THRESHOLD_MULTIPLIER"], 0.01),
+        ("PSD95_THRESHOLD_MULTIPLIER", 0.4, 2.0,
+         INITIAL_PARAMETERS["PSD95_THRESHOLD_MULTIPLIER"], 0.01),
+        ("MIN_PUNCTUM_VOLUME_UM3", 0.0005, 0.05,
+         INITIAL_PARAMETERS["MIN_PUNCTUM_VOLUME_UM3"], 0.0005),
+        ("MAX_PUNCTUM_VOLUME_UM3", 0.05, 3.0,
+         INITIAL_PARAMETERS["MAX_PUNCTUM_VOLUME_UM3"], 0.01),
+        ("COLOCALIZATION_MAX_DISTANCE_UM", 0.1, 1.5,
+         INITIAL_PARAMETERS["COLOCALIZATION_MAX_DISTANCE_UM"], 0.01),
+    ]
+
+    sliders = {}
+    y = 0.34
+    for name, vmin, vmax, initial, step in slider_specs:
+        slider_ax = fig.add_axes([0.22, y, 0.68, 0.025])
+        sliders[name] = Slider(
+            slider_ax,
+            name,
+            vmin,
+            vmax,
+            valinit=initial,
+            valstep=step,
+        )
+        y -= 0.042
+
+    save_ax = fig.add_axes([0.78, 0.025, 0.18, 0.045])
+    save_button = Button(save_ax, "Save settings")
+
+    def current_parameters():
+        return {
+            "SHELL_OUTER_UM": float(sliders["SHELL_OUTER_UM"].val),
+            "SYNAPTOPHYSIN_THRESHOLD_MULTIPLIER":
+                float(sliders["SYNAPTOPHYSIN_THRESHOLD_MULTIPLIER"].val),
+            "PSD95_THRESHOLD_MULTIPLIER":
+                float(sliders["PSD95_THRESHOLD_MULTIPLIER"].val),
+            "MIN_PUNCTUM_VOLUME_UM3":
+                float(sliders["MIN_PUNCTUM_VOLUME_UM3"].val),
+            "MAX_PUNCTUM_VOLUME_UM3":
+                float(sliders["MAX_PUNCTUM_VOLUME_UM3"].val),
+            "COLOCALIZATION_MAX_DISTANCE_UM":
+                float(sliders["COLOCALIZATION_MAX_DISTANCE_UM"].val),
+        }
+
+    def recompute(_=None):
+        params = current_parameters()
+        z = int(sliders["Z_SLICE"].val)
+
+        if params["MIN_PUNCTUM_VOLUME_UM3"] >= params["MAX_PUNCTUM_VOLUME_UM3"]:
+            ax.clear()
+            ax.text(
+                0.5, 0.5,
+                "MIN_PUNCTUM_VOLUME_UM3 must be smaller than MAX_PUNCTUM_VOLUME_UM3",
+                ha="center", va="center", transform=ax.transAxes,
+            )
+            fig.canvas.draw_idle()
+            return
+
+        syp_labels, syp_threshold = detect_from_enhanced(
+            syp_enhanced,
+            spacing,
+            params["SYNAPTOPHYSIN_THRESHOLD_MULTIPLIER"],
+            params["MIN_PUNCTUM_VOLUME_UM3"],
+            params["MAX_PUNCTUM_VOLUME_UM3"],
+        )
+        psd_labels, psd_threshold = detect_from_enhanced(
+            psd_enhanced,
+            spacing,
+            params["PSD95_THRESHOLD_MULTIPLIER"],
+            params["MIN_PUNCTUM_VOLUME_UM3"],
+            params["MAX_PUNCTUM_VOLUME_UM3"],
+        )
+
+        shell = make_union_shell(
+            neun_labels, spacing, params["SHELL_OUTER_UM"]
+        )
+        syp_table = centroid_table_in_mask(syp_labels, shell, spacing)
+        psd_table = centroid_table_in_mask(psd_labels, shell, spacing)
+        pairs = match_pairs(
+            syp_table,
+            psd_table,
+            params["COLOCALIZATION_MAX_DISTANCE_UM"],
+        )
+
+        state["syp_labels"] = syp_labels
+        state["psd_labels"] = psd_labels
+        state["pairs"] = pairs
+
+        ax.clear()
+        ax.imshow(neun_display[z], cmap="gray", vmin=0, vmax=1)
+
+        neun_slice = neun_labels[z] > 0
+        if np.any(neun_slice):
+            ax.contour(
+                neun_slice,
+                levels=[0.5],
+                colors="lime",
+                linewidths=0.9,
+            )
+
+        # Show only puncta intersecting the selected Z slice and lying in the shell.
+        syp_slice_labels = np.unique(syp_labels[z][shell[z]])
+        syp_slice_labels = syp_slice_labels[syp_slice_labels > 0]
+        for label_id in syp_slice_labels:
+            yy, xx = np.where(syp_labels[z] == label_id)
+            if len(xx):
+                ax.scatter(
+                    np.mean(xx), np.mean(yy),
+                    s=25, facecolors="none", edgecolors="red",
+                    linewidths=1.0,
+                )
+
+        psd_slice_labels = np.unique(psd_labels[z][shell[z]])
+        psd_slice_labels = psd_slice_labels[psd_slice_labels > 0]
+        for label_id in psd_slice_labels:
+            yy, xx = np.where(psd_labels[z] == label_id)
+            if len(xx):
+                ax.scatter(
+                    np.mean(xx), np.mean(yy),
+                    s=25, facecolors="none", edgecolors="magenta",
+                    linewidths=1.0,
+                )
+
+        if not pairs.empty:
+            near_z = pairs[
+                np.abs(pairs["midpoint_z_px"] - z) <= 0.75
+            ]
+            if not near_z.empty:
+                ax.scatter(
+                    near_z["midpoint_x_px"],
+                    near_z["midpoint_y_px"],
+                    s=35,
+                    marker="x",
+                    c="yellow",
+                    linewidths=1.1,
+                )
+
+        ax.set_title(
+            f"Z={z} | SYP in shell={len(syp_table)} | "
+            f"PSD95 in shell={len(psd_table)} | matched={len(pairs)}\n"
+            f"SYP threshold={syp_threshold:.4g} | PSD95 threshold={psd_threshold:.4g}"
+        )
+        ax.axis("off")
+        fig.canvas.draw_idle()
+
+    def save_settings(_event):
+        params = current_parameters()
+        params["BACKGROUND_SIGMA_UM"] = BACKGROUND_SIGMA_UM
+        params["SMOOTH_SIGMA_UM"] = SMOOTH_SIGMA_UM
+        params["SCENE_INDEX"] = SCENE_INDEX
+        OUTPUT_JSON.write_text(json.dumps(params, indent=2), encoding="utf-8")
+        print(f"Saved settings to: {OUTPUT_JSON}")
+        print(json.dumps(params, indent=2))
+
+    for slider in sliders.values():
+        slider.on_changed(recompute)
+
+    save_button.on_clicked(save_settings)
+
+    recompute()
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()
