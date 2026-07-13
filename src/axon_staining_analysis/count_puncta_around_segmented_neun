@@ -1,0 +1,645 @@
+#!/usr/bin/env python3
+"""
+FOLLOW-UP ANALYSIS:
+Count Synaptophysin and PSD95 puncta around already segmented NeuN-positive cells.
+
+Channel order in the .ims files:
+    0 = DAPI
+    1 = NeuN
+    2 = Synaptophysin
+    3 = PSD95
+
+The script:
+1. Loads each .ims file using the same BioImage scene as the NeuN segmentation.
+2. Loads the existing NeuN label mask: <image_stem>_mask_3d.tif.
+3. Creates a 3D shell around each NeuN object.
+4. Detects Synaptophysin and PSD95 puncta independently.
+5. Counts puncta in the shell of each NeuN-positive cell.
+6. Matches Synaptophysin and PSD95 puncta one-to-one in 3D to estimate
+   putative colocalized pre-/postsynaptic pairs.
+7. Saves CSV results, label volumes, and a QC maximum-projection image showing:
+      - segmented NeuN boundaries
+      - positive Synaptophysin puncta
+      - positive PSD95 puncta
+      - matched Synaptophysin–PSD95 pairs
+
+Install:
+    pip install numpy pandas scipy scikit-image tifffile matplotlib bioio bioio-ome-tiff bioio-czi bioio-lif
+
+Run:
+    Edit SETTINGS below and run from the IDE/editor.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Dict, List, Tuple
+import warnings
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import tifffile
+from bioio import BioImage
+from scipy.ndimage import distance_transform_edt
+from scipy.optimize import linear_sum_assignment
+from skimage import exposure, filters, measure, morphology, segmentation
+
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+# Folder containing the original .ims files.
+INPUT_ROOT = Path(r"D:\OneDrive - IEM\000_inbox\260604_Kralova_python_troubleshooting\cellpose + far-red channel\data")
+
+# Folder containing masks made by the NeuN segmentation script.
+# The same relative subfolder structure is expected.
+MASK_ROOT = Path(r"L:\Algernon\530\Sarah\segmentation_output_pseudo3d_260611")
+
+# Output folder for puncta analysis.
+OUTPUT_ROOT = Path(r"L:\Algernon\530\Sarah\puncta_analysis_260713")
+
+# Must match the scene used in the segmentation script.
+SCENE_INDEX = 2
+
+# Channel indices.
+DAPI_CHANNEL = 0
+NEUN_CHANNEL = 1
+SYNAPTOPHYSIN_CHANNEL = 2
+PSD95_CHANNEL = 3
+
+# Skip filenames containing this string.
+SKIP_NAME_TOKEN = "Overview"
+
+# Radius of the analyzed 3D shell outside each NeuN mask.
+# A punctum is assigned to a neuron when its centroid lies in this shell.
+SHELL_INNER_UM = 0.0
+SHELL_OUTER_UM = 5.0
+
+# Puncta preprocessing.
+BACKGROUND_SIGMA_UM = 0.8
+SMOOTH_SIGMA_UM = 0.15
+
+# Puncta thresholds.
+# 1.0 = Otsu threshold after background subtraction.
+# Increase to be stricter; decrease to detect dimmer puncta.
+SYNAPTOPHYSIN_THRESHOLD_MULTIPLIER = 1.0
+PSD95_THRESHOLD_MULTIPLIER = 1.0
+
+# Allowed connected-component volume.
+# These values MUST be visually validated on QC images.
+MIN_PUNCTUM_VOLUME_UM3 = 0.003
+MAX_PUNCTUM_VOLUME_UM3 = 1.0
+
+# Maximum 3D center-to-center separation for a Synaptophysin–PSD95 pair.
+COLOCALIZATION_MAX_DISTANCE_UM = 0.5
+
+# Remove puncta touching image borders.
+REMOVE_BORDER_PUNCTA = False
+
+# Save full 3D label stacks.
+SAVE_LABEL_VOLUMES = True
+
+# QC projection settings.
+QC_DPI = 200
+QC_MARKER_SIZE = 12
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def find_ims_files(root: Path, skip_token: str) -> List[Path]:
+    token = skip_token.lower()
+    files = []
+    for path in root.rglob("*.ims"):
+        if token and token in path.name.lower():
+            continue
+        files.append(path)
+    return sorted(files)
+
+
+def get_voxel_size_um(image: BioImage) -> Tuple[float, float, float]:
+    """
+    Returns voxel size as (z_um, y_um, x_um).
+    """
+    px = image.metadata.images[0].pixels
+    x = float(px.physical_size_x) if px.physical_size_x is not None else np.nan
+    y = float(px.physical_size_y) if px.physical_size_y is not None else x
+    z = float(px.physical_size_z) if px.physical_size_z is not None else np.nan
+
+    if not np.isfinite(x) or not np.isfinite(y):
+        raise ValueError("Missing XY pixel size in image metadata.")
+
+    if not np.isfinite(z):
+        warnings.warn(
+            "Missing Z spacing in metadata. Z spacing is being set equal to XY spacing. "
+            "Replace this with the correct value if necessary."
+        )
+        z = x
+
+    return z, y, x
+
+
+def load_scene_channels(path: Path) -> Tuple[Dict[str, np.ndarray], Tuple[float, float, float]]:
+    bio = BioImage(str(path))
+    if SCENE_INDEX >= len(bio.scenes):
+        raise IndexError(
+            f"{path.name}: SCENE_INDEX={SCENE_INDEX}, but image has only {len(bio.scenes)} scene(s)."
+        )
+
+    bio.set_scene(bio.scenes[SCENE_INDEX])
+    spacing = get_voxel_size_um(bio)
+
+    channels = {
+        "dapi": np.asarray(bio.get_image_data("ZYX", C=DAPI_CHANNEL, T=0), dtype=np.float32),
+        "neun": np.asarray(bio.get_image_data("ZYX", C=NEUN_CHANNEL, T=0), dtype=np.float32),
+        "synaptophysin": np.asarray(
+            bio.get_image_data("ZYX", C=SYNAPTOPHYSIN_CHANNEL, T=0), dtype=np.float32
+        ),
+        "psd95": np.asarray(bio.get_image_data("ZYX", C=PSD95_CHANNEL, T=0), dtype=np.float32),
+    }
+    return channels, spacing
+
+
+def robust_rescale(volume: np.ndarray) -> np.ndarray:
+    finite = volume[np.isfinite(volume)]
+    if finite.size == 0:
+        return np.zeros_like(volume, dtype=np.float32)
+
+    lo, hi = np.percentile(finite, (0.2, 99.8))
+    if hi <= lo:
+        return np.zeros_like(volume, dtype=np.float32)
+
+    return exposure.rescale_intensity(
+        volume, in_range=(lo, hi), out_range=(0.0, 1.0)
+    ).astype(np.float32)
+
+
+def ellipsoid_footprint(radius_um: float, spacing_zyx: Tuple[float, float, float]) -> np.ndarray:
+    """
+    An approximately isotropic 3D footprint defined in physical units.
+    """
+    rz = max(1, int(np.ceil(radius_um / spacing_zyx[0])))
+    ry = max(1, int(np.ceil(radius_um / spacing_zyx[1])))
+    rx = max(1, int(np.ceil(radius_um / spacing_zyx[2])))
+
+    zz, yy, xx = np.ogrid[-rz:rz + 1, -ry:ry + 1, -rx:rx + 1]
+    footprint = (
+        (zz * spacing_zyx[0]) ** 2
+        + (yy * spacing_zyx[1]) ** 2
+        + (xx * spacing_zyx[2]) ** 2
+    ) <= radius_um ** 2
+    return footprint
+
+
+def gaussian_sigma_pixels(
+    sigma_um: float,
+    spacing_zyx: Tuple[float, float, float],
+) -> Tuple[float, float, float]:
+    return tuple(float(sigma_um / s) for s in spacing_zyx)
+
+
+def detect_puncta_3d(
+    volume: np.ndarray,
+    spacing_zyx: Tuple[float, float, float],
+    threshold_multiplier: float,
+) -> Tuple[np.ndarray, np.ndarray, float]:
+    """
+    Returns:
+        filtered_labels, enhanced_volume, applied_threshold
+    """
+    img = robust_rescale(volume)
+
+    background = filters.gaussian(
+        img,
+        sigma=gaussian_sigma_pixels(BACKGROUND_SIGMA_UM, spacing_zyx),
+        preserve_range=True,
+    )
+    enhanced = np.clip(img - background, 0, None)
+
+    if SMOOTH_SIGMA_UM > 0:
+        enhanced = filters.gaussian(
+            enhanced,
+            sigma=gaussian_sigma_pixels(SMOOTH_SIGMA_UM, spacing_zyx),
+            preserve_range=True,
+        )
+
+    positive_values = enhanced[enhanced > 0]
+    if positive_values.size == 0:
+        return np.zeros_like(volume, dtype=np.int32), enhanced, np.nan
+
+    threshold = float(filters.threshold_otsu(positive_values) * threshold_multiplier)
+    binary = enhanced > threshold
+    binary = morphology.binary_opening(binary, morphology.ball(1))
+
+    if REMOVE_BORDER_PUNCTA:
+        binary = segmentation.clear_border(binary)
+
+    labels = measure.label(binary, connectivity=3)
+
+    voxel_volume_um3 = float(np.prod(spacing_zyx))
+    keep = np.zeros_like(labels, dtype=bool)
+
+    for region in measure.regionprops(labels):
+        volume_um3 = region.area * voxel_volume_um3
+        if MIN_PUNCTUM_VOLUME_UM3 <= volume_um3 <= MAX_PUNCTUM_VOLUME_UM3:
+            keep[labels == region.label] = True
+
+    filtered = measure.label(keep, connectivity=3).astype(np.int32)
+    return filtered, enhanced, threshold
+
+
+def create_shell(
+    cell_mask: np.ndarray,
+    spacing_zyx: Tuple[float, float, float],
+) -> np.ndarray:
+    """
+    Creates a shell using a physical-distance transform, so anisotropic Z spacing
+    is treated correctly.
+    """
+    distance_outside_um = distance_transform_edt(
+        ~cell_mask,
+        sampling=spacing_zyx,
+    )
+
+    shell = (
+        (distance_outside_um > SHELL_INNER_UM)
+        & (distance_outside_um <= SHELL_OUTER_UM)
+        & (~cell_mask)
+    )
+    return shell
+
+
+def puncta_table_in_mask(
+    labels: np.ndarray,
+    analysis_mask: np.ndarray,
+    spacing_zyx: Tuple[float, float, float],
+) -> pd.DataFrame:
+    rows = []
+    shape = labels.shape
+    voxel_volume_um3 = float(np.prod(spacing_zyx))
+
+    for region in measure.regionprops(labels):
+        z, y, x = region.centroid
+        zi = int(np.clip(round(z), 0, shape[0] - 1))
+        yi = int(np.clip(round(y), 0, shape[1] - 1))
+        xi = int(np.clip(round(x), 0, shape[2] - 1))
+
+        if analysis_mask[zi, yi, xi]:
+            rows.append({
+                "object_id": int(region.label),
+                "z_px": float(z),
+                "y_px": float(y),
+                "x_px": float(x),
+                "z_um": float(z * spacing_zyx[0]),
+                "y_um": float(y * spacing_zyx[1]),
+                "x_um": float(x * spacing_zyx[2]),
+                "volume_um3": float(region.area * voxel_volume_um3),
+            })
+
+    return pd.DataFrame(rows)
+
+
+def match_one_to_one(
+    syp: pd.DataFrame,
+    psd: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    One-to-one global matching using physical 3D centroid distances.
+    """
+    columns = [
+        "synaptophysin_object_id",
+        "psd95_object_id",
+        "distance_um",
+        "midpoint_z_px",
+        "midpoint_y_px",
+        "midpoint_x_px",
+    ]
+
+    if syp.empty or psd.empty:
+        return pd.DataFrame(columns=columns)
+
+    a_um = syp[["z_um", "y_um", "x_um"]].to_numpy()
+    b_um = psd[["z_um", "y_um", "x_um"]].to_numpy()
+
+    distances = np.sqrt(((a_um[:, None, :] - b_um[None, :, :]) ** 2).sum(axis=2))
+    row_idx, col_idx = linear_sum_assignment(distances)
+
+    rows = []
+    for i, j in zip(row_idx, col_idx):
+        distance = float(distances[i, j])
+        if distance <= COLOCALIZATION_MAX_DISTANCE_UM:
+            rows.append({
+                "synaptophysin_object_id": int(syp.iloc[i]["object_id"]),
+                "psd95_object_id": int(psd.iloc[j]["object_id"]),
+                "distance_um": distance,
+                "midpoint_z_px": float((syp.iloc[i]["z_px"] + psd.iloc[j]["z_px"]) / 2),
+                "midpoint_y_px": float((syp.iloc[i]["y_px"] + psd.iloc[j]["y_px"]) / 2),
+                "midpoint_x_px": float((syp.iloc[i]["x_px"] + psd.iloc[j]["x_px"]) / 2),
+            })
+
+    return pd.DataFrame(rows, columns=columns)
+
+
+def label_centroids_for_projection(labels: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    yy, xx = [], []
+    for region in measure.regionprops(labels):
+        _, y, x = region.centroid
+        yy.append(y)
+        xx.append(x)
+    return np.asarray(yy), np.asarray(xx)
+
+
+def save_qc_projection(
+    out_path: Path,
+    neun_volume: np.ndarray,
+    neun_labels: np.ndarray,
+    syp_labels: np.ndarray,
+    psd_labels: np.ndarray,
+    pair_rows: pd.DataFrame,
+) -> None:
+    """
+    Saves a maximum projection showing exactly which detected puncta were
+    considered positive and the NeuN segmentation used for the analysis.
+    """
+    neun_projection = robust_rescale(np.max(neun_volume, axis=0))
+    neun_binary_projection = np.max(neun_labels > 0, axis=0)
+
+    syp_y, syp_x = label_centroids_for_projection(syp_labels)
+    psd_y, psd_x = label_centroids_for_projection(psd_labels)
+
+    fig, ax = plt.subplots(figsize=(11, 11))
+    ax.imshow(neun_projection, cmap="gray")
+    ax.contour(neun_binary_projection, levels=[0.5], colors="cyan", linewidths=0.8)
+
+    if len(syp_x):
+        ax.scatter(
+            syp_x, syp_y,
+            s=QC_MARKER_SIZE,
+            facecolors="none",
+            edgecolors="lime",
+            linewidths=0.7,
+            label="Synaptophysin-positive puncta",
+        )
+
+    if len(psd_x):
+        ax.scatter(
+            psd_x, psd_y,
+            s=QC_MARKER_SIZE,
+            facecolors="none",
+            edgecolors="magenta",
+            linewidths=0.7,
+            label="PSD95-positive puncta",
+        )
+
+    if not pair_rows.empty:
+        ax.scatter(
+            pair_rows["midpoint_x_px"],
+            pair_rows["midpoint_y_px"],
+            s=QC_MARKER_SIZE * 1.5,
+            marker="x",
+            c="yellow",
+            linewidths=0.8,
+            label="Matched SYP–PSD95 pair",
+        )
+
+    ax.set_title(
+        "QC projection: NeuN segmentation and detected positive puncta\n"
+        "cyan=NeuN, green=Synaptophysin, magenta=PSD95, yellow=matched pair"
+    )
+    ax.axis("off")
+    ax.legend(loc="upper right", fontsize=8, framealpha=0.8)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=QC_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def analyze_one_image(
+    ims_path: Path,
+    mask_path: Path,
+    output_dir: Path,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    channels, spacing = load_scene_channels(ims_path)
+    neun_labels = tifffile.imread(mask_path).astype(np.int32)
+
+    expected_shape = channels["neun"].shape
+    if neun_labels.shape != expected_shape:
+        raise ValueError(
+            f"Mask/image shape mismatch: mask={neun_labels.shape}, image={expected_shape}. "
+            "Use the same scene and spatial scaling as in the segmentation script."
+        )
+
+    syp_labels, _, syp_threshold = detect_puncta_3d(
+        channels["synaptophysin"],
+        spacing,
+        SYNAPTOPHYSIN_THRESHOLD_MULTIPLIER,
+    )
+    psd_labels, _, psd_threshold = detect_puncta_3d(
+        channels["psd95"],
+        spacing,
+        PSD95_THRESHOLD_MULTIPLIER,
+    )
+
+    per_cell_rows = []
+    all_pair_rows = []
+
+    voxel_volume_um3 = float(np.prod(spacing))
+
+    for region in measure.regionprops(neun_labels):
+        cell_id = int(region.label)
+        cell_mask = neun_labels == cell_id
+        shell = create_shell(cell_mask, spacing)
+        shell_volume_um3 = float(shell.sum() * voxel_volume_um3)
+
+        syp = puncta_table_in_mask(syp_labels, shell, spacing)
+        psd = puncta_table_in_mask(psd_labels, shell, spacing)
+        pairs = match_one_to_one(syp, psd)
+
+        if not pairs.empty:
+            pairs = pairs.copy()
+            pairs["cell_id"] = cell_id
+            all_pair_rows.append(pairs)
+
+        per_cell_rows.append({
+            "file_name": ims_path.name,
+            "image_stem": ims_path.stem,
+            "animal_id": ims_path.stem.split("_", 1)[0],
+            "cell_id": cell_id,
+            "voxel_size_z_um": spacing[0],
+            "voxel_size_y_um": spacing[1],
+            "voxel_size_x_um": spacing[2],
+            "neun_volume_um3": float(region.area * voxel_volume_um3),
+            "shell_volume_um3": shell_volume_um3,
+            "synaptophysin_count": int(len(syp)),
+            "psd95_count": int(len(psd)),
+            "colocalized_pair_count": int(len(pairs)),
+            "synaptophysin_density_per_100_um3": (
+                100.0 * len(syp) / shell_volume_um3 if shell_volume_um3 > 0 else np.nan
+            ),
+            "psd95_density_per_100_um3": (
+                100.0 * len(psd) / shell_volume_um3 if shell_volume_um3 > 0 else np.nan
+            ),
+            "colocalized_density_per_100_um3": (
+                100.0 * len(pairs) / shell_volume_um3 if shell_volume_um3 > 0 else np.nan
+            ),
+            "fraction_synaptophysin_paired": (
+                len(pairs) / len(syp) if len(syp) > 0 else np.nan
+            ),
+            "fraction_psd95_paired": (
+                len(pairs) / len(psd) if len(psd) > 0 else np.nan
+            ),
+            "mean_pair_distance_um": (
+                float(pairs["distance_um"].mean()) if not pairs.empty else np.nan
+            ),
+        })
+
+    per_cell = pd.DataFrame(per_cell_rows)
+    all_pairs = (
+        pd.concat(all_pair_rows, ignore_index=True)
+        if all_pair_rows
+        else pd.DataFrame()
+    )
+
+    # A sample-level summary is convenient for the second script.
+    summary = pd.DataFrame([{
+        "file_name": ims_path.name,
+        "image_stem": ims_path.stem,
+        "animal_id": ims_path.stem.split("_", 1)[0],
+        "neun_cell_count": int(neun_labels.max()),
+        "total_synaptophysin_puncta_whole_image": int(syp_labels.max()),
+        "total_psd95_puncta_whole_image": int(psd_labels.max()),
+        "mean_synaptophysin_count_per_neun": (
+            per_cell["synaptophysin_count"].mean() if not per_cell.empty else np.nan
+        ),
+        "mean_psd95_count_per_neun": (
+            per_cell["psd95_count"].mean() if not per_cell.empty else np.nan
+        ),
+        "mean_colocalized_pairs_per_neun": (
+            per_cell["colocalized_pair_count"].mean() if not per_cell.empty else np.nan
+        ),
+        "mean_synaptophysin_density_per_100_um3": (
+            per_cell["synaptophysin_density_per_100_um3"].mean() if not per_cell.empty else np.nan
+        ),
+        "mean_psd95_density_per_100_um3": (
+            per_cell["psd95_density_per_100_um3"].mean() if not per_cell.empty else np.nan
+        ),
+        "mean_colocalized_density_per_100_um3": (
+            per_cell["colocalized_density_per_100_um3"].mean() if not per_cell.empty else np.nan
+        ),
+        "mean_fraction_synaptophysin_paired": (
+            per_cell["fraction_synaptophysin_paired"].mean() if not per_cell.empty else np.nan
+        ),
+        "mean_fraction_psd95_paired": (
+            per_cell["fraction_psd95_paired"].mean() if not per_cell.empty else np.nan
+        ),
+        "synaptophysin_threshold": syp_threshold,
+        "psd95_threshold": psd_threshold,
+    }])
+
+    pair_for_qc = all_pairs if not all_pairs.empty else pd.DataFrame()
+    save_qc_projection(
+        output_dir / f"{ims_path.stem}_puncta_QC.png",
+        channels["neun"],
+        neun_labels,
+        syp_labels,
+        psd_labels,
+        pair_for_qc,
+    )
+
+    if SAVE_LABEL_VOLUMES:
+        tifffile.imwrite(
+            output_dir / f"{ims_path.stem}_puncta_labels_3d.tif",
+            np.stack([neun_labels, syp_labels, psd_labels]).astype(np.uint32),
+            metadata={
+                "axes": "CZYX",
+                "Channel": {"Name": ["NeuN masks", "Synaptophysin puncta", "PSD95 puncta"]},
+            },
+        )
+
+    if not all_pairs.empty:
+        all_pairs.to_csv(
+            output_dir / f"{ims_path.stem}_matched_pairs.csv",
+            index=False,
+        )
+
+    return per_cell, summary
+
+
+def main() -> None:
+    if not INPUT_ROOT.exists():
+        raise FileNotFoundError(f"INPUT_ROOT does not exist: {INPUT_ROOT}")
+    if not MASK_ROOT.exists():
+        raise FileNotFoundError(f"MASK_ROOT does not exist: {MASK_ROOT}")
+
+    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+
+    files = find_ims_files(INPUT_ROOT, SKIP_NAME_TOKEN)
+    if not files:
+        print("No eligible .ims files found.")
+        return
+
+    all_cells = []
+    all_summaries = []
+    log_rows = []
+
+    for index, ims_path in enumerate(files, start=1):
+        relative_parent = ims_path.parent.relative_to(INPUT_ROOT)
+        mask_path = MASK_ROOT / relative_parent / f"{ims_path.stem}_mask_3d.tif"
+        output_dir = OUTPUT_ROOT / relative_parent
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        print(f"[{index}/{len(files)}] {ims_path.name}")
+
+        if not mask_path.exists():
+            message = f"Mask not found: {mask_path}"
+            print(f"  SKIPPED: {message}")
+            log_rows.append({
+                "file_name": ims_path.name,
+                "status": "skipped",
+                "error": message,
+            })
+            continue
+
+        try:
+            per_cell, summary = analyze_one_image(ims_path, mask_path, output_dir)
+            all_cells.append(per_cell)
+            all_summaries.append(summary)
+            log_rows.append({
+                "file_name": ims_path.name,
+                "status": "ok",
+                "error": None,
+            })
+            print("  Done.")
+        except Exception as exc:
+            print(f"  ERROR: {exc}")
+            log_rows.append({
+                "file_name": ims_path.name,
+                "status": "error",
+                "error": str(exc),
+            })
+
+        pd.DataFrame(log_rows).to_csv(OUTPUT_ROOT / "puncta_analysis_log.csv", index=False)
+
+    if all_cells:
+        pd.concat(all_cells, ignore_index=True).to_csv(
+            OUTPUT_ROOT / "all_images_per_neun_cell.csv",
+            index=False,
+        )
+
+    if all_summaries:
+        pd.concat(all_summaries, ignore_index=True).to_csv(
+            OUTPUT_ROOT / "all_images_sample_summary.csv",
+            index=False,
+        )
+
+    pd.DataFrame(log_rows).to_csv(
+        OUTPUT_ROOT / "puncta_analysis_log.csv",
+        index=False,
+    )
+    print("Finished.")
+
+
+if __name__ == "__main__":
+    main()
