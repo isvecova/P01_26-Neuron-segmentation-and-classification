@@ -15,8 +15,8 @@ import skimage.transform
 import skimage.segmentation
 
 # --- Paths ---
-INPUT_ROOT = Path(r"L:\0_Service\Sarah\Croatia project")   # root folder containing the original .ims images
-MASK_ROOT = INPUT_ROOT / "masks_cellpose_sam_3d_Algernon"  # root folder containing the 3-D segmentation masks
+INPUT_ROOT = Path(r"N:\Sarah\CHST11KO&P301S project\DAPI, 488 NeuN, 594 AT8, 647 WFA")   # root folder containing the original .ims images
+MASK_ROOT = INPUT_ROOT / "segmentation_output_pseudo3d_260611"  # root folder containing the 3-D segmentation masks
 HISTOGRAM_ROOT = INPUT_ROOT / "histograms"                 # output folder for histograms and CSVs
 OVERVIEWS_ROOT = INPUT_ROOT / "overviews"                  # output folder for MIP overlay TIFFs
 

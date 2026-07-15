@@ -36,6 +36,8 @@ red_channel = 2
 timepoint = 0
 
 NON_BINNED_STEP = 0.152
+TARGET_EFFECTIVE_XY_STEP = NON_BINNED_STEP * 16  # keep display scale aligned with 4x-binned images using factor 4
+DEFAULT_DOWNSAMPLE_FACTOR = 4
 
 MASK_ROOT = Path(r"N:\Sarah\CHST11KO&P301S project\DAPI, 488 NeuN, 594 AT8, 647 WFA\segmentation_output_pseudo3d_260611")
 root_folder = Path(
@@ -92,6 +94,7 @@ def load_image_and_mask(image_name):
     mask_path = MASK_ROOT / image_rel_dirs[image_name] / f"{image_name}_input_channel.tif"
 
     img = BioImage(image_path)
+    selected_x_step = None
     if img.scenes:
         n_scenes = len(img.scenes)
         print(f"  Image has {n_scenes} scene(s): {img.scenes}")
@@ -99,6 +102,7 @@ def load_image_and_mask(image_name):
         if n_scenes == 1:
             img.set_scene(img.scenes[0])
             print(f"  Single scene, using scene_index=0")
+            selected_x_step = img.metadata.images[0].pixels.physical_size_x
         else:
             chosen = None
             for i, scene_name in enumerate(img.scenes):
@@ -115,6 +119,7 @@ def load_image_and_mask(image_name):
 
             img.set_scene(img.scenes[chosen])
             print(f"  Selected scene_index={chosen}")
+            selected_x_step = img.metadata.images[0].pixels.physical_size_x
 
     data = img.get_image_data("CZYX", T=timepoint)
 
@@ -122,11 +127,21 @@ def load_image_and_mask(image_name):
     red = data[red_channel]
 
     # Downsample XY for display speed (Z is kept full to preserve z-placement of points)
-    DOWNSAMPLE_FACTOR = 4  # adjust: 2 = half size, 4 = quarter size in XY
-    if DOWNSAMPLE_FACTOR > 1:
+    # Adapt factor from physical_size_x so mixed binning levels end up at a similar display scale.
+    if selected_x_step is None or selected_x_step <= 0:
+        downsample_factor = DEFAULT_DOWNSAMPLE_FACTOR
+        print(f"  physical_size_x missing/invalid -> using default downsample={downsample_factor}")
+    else:
+        downsample_factor = int(np.clip(np.rint(TARGET_EFFECTIVE_XY_STEP / selected_x_step), 1, 32))
+        print(
+            f"  physical_size_x={selected_x_step:.4f} -> adaptive downsample={downsample_factor} "
+            f"(target effective step={TARGET_EFFECTIVE_XY_STEP:.4f})"
+        )
+
+    if downsample_factor > 1:
         from skimage.transform import downscale_local_mean
-        green = downscale_local_mean(green, (1, DOWNSAMPLE_FACTOR, DOWNSAMPLE_FACTOR)).astype(np.float32)
-        red   = downscale_local_mean(red,   (1, DOWNSAMPLE_FACTOR, DOWNSAMPLE_FACTOR)).astype(np.float32)
+        green = downscale_local_mean(green, (1, downsample_factor, downsample_factor)).astype(np.float32)
+        red   = downscale_local_mean(red,   (1, downsample_factor, downsample_factor)).astype(np.float32)
 
     labels = tiff.imread(mask_path)
     labels = np.asarray(labels)

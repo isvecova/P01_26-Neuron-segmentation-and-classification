@@ -4,7 +4,8 @@
 from pathlib import Path
 import pandas as pd
 
-INPUT_ROOT = Path(r"N:\01_scientific_data\Sarah_Kralova_brain_slice_data\cellpose + far-red channel")
+# INPUT_ROOT = Path(r"N:\Sarah\CHST11KO&P301S project\DAPI, 488 NeuN, 594 AT8, 647 WFA")
+INPUT_ROOT = Path(r"N:\Sarah\CHST11KO&P301S project\DAPI, 488 NeuN, 594 AT8, 647 WFA")
 folder = INPUT_ROOT / "histograms"
 
 dfs = []

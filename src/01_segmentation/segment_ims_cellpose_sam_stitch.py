@@ -27,8 +27,8 @@ from datetime import datetime
 # SETTINGS (edit these)
 # =========================
 # INPUT_ROOT = Path(r"L:\0_Service\Sarah\Croatia project")
-INPUT_ROOT = Path(r"D:\OneDrive - IEM\000_inbox\260604_Kralova_python_troubleshooting\cellpose + far-red channel\data")
-OUTPUT_ROOT = Path(r"L:\Algernon\530\Sarah\segmentation_output_pseudo3d_260611")
+INPUT_ROOT = Path(r"N:\Sarah\Croatia project\DAPI, 488 NeuN, 594 Synaptophysin, 647 PSD95")
+OUTPUT_ROOT = Path(r"N:\Sarah\Croatia project\DAPI, 488 NeuN, 594 Synaptophysin, 647 PSD95")
 
 # Channel selection: second channel = index 1
 CHANNEL_INDEX = 1
@@ -41,11 +41,16 @@ CELLPROB_THRESHOLD = -2
 ANISOTROPY = 1.5
 STITCH_THRESOLD = 0.1
 USE_GPU = True
-MODEL_PATH = r"N:\03_analysis_tools\Sarah_cellpose_training_script\models\260610_cellpose_Kralova_retrained_1"
+MODEL_PATH = r"N:\Sarah\CHST11KO&P301S project\DAPI, 488 NeuN, 594 AT8, 647 WFA\new analysis_code+model\models\260610_cellpose_Kralova_retrained_1"
 
 NON_BINNED_STEP = 0.152
 # Comment: The dataset contains both binned and non-binned images. The non-binned images have a pixel size of 0.152 µm, while the binned images have a pixel size of 0.304 µm. 
 # The script will automatically downscale the non-binned images to match the binned resolution for consistent processing.
+
+# Preferred BioIO scene index to read from (the 4x-binned pyramid scene, for
+# faster processing). Not every file has this many scenes, so
+# extract_channel_volumes_zyx() falls back to scene 0 when it's missing.
+PREFERRED_SCENE_INDEX = 2
 
 
 def inspect_existing_mask(mask_path: Path) -> tuple[bool, str, tuple | None]:
@@ -92,8 +97,18 @@ def extract_channel_volumes_zyx(image: BioImage, channel_index: int) -> np.ndarr
     """
     Extract one channel as float32 array with shape (T, Z, Y, X).
     """
-    if image.scenes:
-        image.set_scene(image.scenes[0])
+    # Prefer the 4x-binned scene (PREFERRED_SCENE_INDEX) for faster
+    # processing, but fall back gracefully if this file doesn't have that
+    # many scenes -- previously this selection was silently overwritten by
+    # a hardcoded set_scene(image.scenes[0]) here, so every file was always
+    # read at native/full resolution regardless of what main() requested.
+    scene_index = PREFERRED_SCENE_INDEX if len(image.scenes) > PREFERRED_SCENE_INDEX else 0
+    if scene_index != PREFERRED_SCENE_INDEX:
+        print(
+            f"  File has only {len(image.scenes)} scene(s); "
+            f"falling back to scene_index=0 instead of {PREFERRED_SCENE_INDEX}."
+        )
+    image.set_scene(image.scenes[scene_index])
 
     arr = image.get_image_data("ZYX", C=channel_index, T=0)
     arr = np.asarray(arr)
@@ -101,7 +116,10 @@ def extract_channel_volumes_zyx(image: BioImage, channel_index: int) -> np.ndarr
     if arr.ndim != 3:
         raise ValueError(f"Expected shape (Z, Y, X), got {arr.shape}")
 
-    x_step = image.metadata.images[0].pixels.physical_size_x
+    # Read physical_size_x from the scene we actually read data from --
+    # metadata.images is indexed per-scene, so using the wrong index here
+    # would report the wrong pixel size for scene_index != 0.
+    x_step = image.metadata.images[scene_index].pixels.physical_size_x
     downscaled = False
     if x_step is not None and np.abs(x_step - NON_BINNED_STEP) < 0.1:
         arr = skimage.transform.downscale_local_mean(arr, (1, 2, 2))
@@ -228,8 +246,10 @@ def main() -> None:
 
         try:
             # 1) Read channel data from BioImage
+            # Scene selection (preferring the 4x-binned scene when
+            # available) happens inside extract_channel_volumes_zyx, so
+            # that it's not silently overwritten afterwards.
             bio = BioImage(str(ims_path))
-            bio.set_scene(bio.scenes[2])  # Use the 4x binned scene for faster processing
             volume_zyx, downscaled = extract_channel_volumes_zyx(bio, CHANNEL_INDEX)
 
             # Save the median-filtered input volume for debugging and visualization purposes.

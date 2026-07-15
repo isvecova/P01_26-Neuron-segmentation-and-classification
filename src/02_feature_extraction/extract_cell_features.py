@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+##!/usr/bin/env python3
 
 # The script extract cell features from 3D cellpose segmentation masks and corresponding multi-channel images.
 # It saves the extracted features to a CSV file and generates overview images and histograms for quality control.
@@ -34,8 +34,8 @@ from skimage.measure import label as cc_label, regionprops
 # Paths
 # ---------------------------------------------------------------------------
 
-INPUT_ROOT = Path(r"N:\01_scientific_data\Sarah_Kralova_brain_slice_data\cellpose + far-red channel")
-MASK_ROOT = Path(r"L:\Algernon\530\Sarah\segmentation_output_pseudo3d_260611")
+INPUT_ROOT = Path(r"N:\Sarah\CHST11KO&P301S project\DAPI, 488 NeuN, 594 AT8, 647 WFA")
+MASK_ROOT = Path(r"N:\Sarah\CHST11KO&P301S project\DAPI, 488 NeuN, 594 AT8, 647 WFA\segmentation_output_pseudo3d_260611")
 
 HISTOGRAM_ROOT = INPUT_ROOT / "histograms"
 OVERVIEWS_ROOT = INPUT_ROOT / "overviews"
@@ -113,24 +113,45 @@ def read_ims_channels_bioio(
         XY pixel size in µm
     z_spacing : float
         Z spacing in µm
+    read_mode : str
+        Provenance tag describing how this image was read/resolved:
+        - "binned_scene0": genuinely binned acquisition, read at scene 0.
+        - "non_binned_pyramid_scene1": non-binned acquisition, read from a
+          pre-computed lower-resolution pyramid scene (scene 1).
+        - "non_binned_native_scene0": non-binned acquisition, but no second
+          scene was available, so it was read at native (full) resolution
+          instead. downscale_image_to_mask_shape() in main() will still
+          align this to the mask shape downstream.
     """
     bio = BioImage(str(path))
 
     x_step = bio.metadata.images[0].pixels.physical_size_x
-    if x_step is not None and np.abs(x_step - NON_BINNED_STEP) < 0.1:
-        scene_index = 1
-        print(f"  Detected non-binned image, using scene_index={scene_index}")
-    else: 
+    is_non_binned = x_step is not None and np.abs(x_step - NON_BINNED_STEP) < 0.1
+
+    if is_non_binned:
+        # Non-binned images are much higher resolution than binned ones.
+        # When available, scene_index=1 is a pre-computed lower-resolution
+        # pyramid level, which is cheaper to read than full resolution.
+        # Not every non-binned file has this second scene, though, so fall
+        # back to scene_index=0 (native resolution) when it's missing --
+        # downscale_image_to_mask_shape() further down still aligns the
+        # image to the mask shape either way, so results stay consistent.
+        if len(bio.scenes) > 1:
+            scene_index = 1
+            print(f"  Detected non-binned image, using scene_index={scene_index}")
+        else:
+            scene_index = 0
+            print(
+                f"  Detected non-binned image, but file only has "
+                f"{len(bio.scenes)} scene(s). Falling back to scene_index=0 "
+                f"(native resolution); downscaling to mask shape will "
+                f"handle alignment downstream."
+            )
+    else:
         scene_index = 0
         print(f"  Detected binned image, using scene_index={scene_index}")
 
-    if scene_index is not None:
-        if scene_index >= len(bio.scenes):
-            raise ValueError(
-                f"Requested scene_index={scene_index}, but file has only "
-                f"{len(bio.scenes)} scenes: {bio.scenes}"
-            )
-        bio.set_scene(bio.scenes[scene_index])
+    bio.set_scene(bio.scenes[scene_index])
 
     data = bio.get_image_data("CZYX", T=0)
 
@@ -144,8 +165,15 @@ def read_ims_channels_bioio(
 
     print(f"  Image spacing: xy={xy_spacing:.4f} µm, z={z_spacing:.4f} µm")
 
+    if is_non_binned and scene_index == 1:
+        read_mode = "non_binned_pyramid_scene1"
+    elif is_non_binned and scene_index == 0:
+        read_mode = "non_binned_native_scene0"
+    else:
+        read_mode = "binned_scene0"
+
     # channel_indices retained for compatibility with previous function signature
-    return data, xy_spacing, z_spacing
+    return data, xy_spacing, z_spacing, read_mode
 
 
 # ---------------------------------------------------------------------------
@@ -874,6 +902,47 @@ def save_overlay(image_name, green_channel, red_channel, mask_data, props_df):
 
 
 # ---------------------------------------------------------------------------
+# Output completeness check
+# ---------------------------------------------------------------------------
+
+EXPECTED_HISTOGRAM_TEMPLATES = [
+    "{name}_area_histogram.png",
+    "{name}_num_pixels_histogram.png",
+    "{name}_intensity_mean_green_histogram.png",
+    "{name}_intensity_p95_green_histogram.png",
+    "{name}_intensity_mean_red_histogram.png",
+    "{name}_intensity_p95_red_histogram.png",
+    "{name}_intensity_mean_farred_histogram.png",
+    "{name}_intensity_p95_farred_histogram.png",
+]
+
+
+def check_image_outputs_complete(image_name: str) -> tuple[bool, list[str]]:
+    """
+    Check whether all expected output files exist for a given image.
+
+    Returns
+    -------
+    complete : bool
+        True if every expected file is present.
+    missing : list[str]
+        Paths of any missing files (empty if complete).
+    """
+    expected = [
+        HISTOGRAM_ROOT / f"{image_name}_props.csv",
+        OVERVIEWS_ROOT / f"{image_name}_channel_mips_with_mask_outlines.png",
+        OVERVIEWS_ROOT / f"{image_name}_mip_overlay.png",
+        *[
+            HISTOGRAM_ROOT / tmpl.format(name=image_name)
+            for tmpl in EXPECTED_HISTOGRAM_TEMPLATES
+        ],
+    ]
+
+    missing = [str(p) for p in expected if not p.exists()]
+    return len(missing) == 0, missing
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -897,6 +966,21 @@ def main() -> None:
     for i, mask_path in enumerate(mask_files, start=1):
         print(f"[{i}/{len(mask_files)}] Processing {mask_path}")
 
+        # Derive image_name early so we can check completeness before loading data
+        mask_name = mask_path.stem
+        image_name = mask_name.replace(MASK_SUFFIX, "")
+
+        # --- Check whether all outputs already exist; skip if so ---
+        complete, missing = check_image_outputs_complete(image_name)
+        if complete:
+            print(f"  All outputs already exist for '{image_name}' — skipping.")
+            continue
+        else:
+            print(f"  Missing {len(missing)} output(s), will (re)process:")
+            for m in missing:
+                print(f"    {m}")
+        # ------------------------------------------------------------
+
         mask_data = tifffile.imread(str(mask_path)).squeeze()
         print(f"  mask shape: {mask_data.shape}")
 
@@ -906,8 +990,6 @@ def main() -> None:
 
         mask_data = mask_data.astype(np.uint32, copy=False)
 
-        mask_name = mask_path.stem
-        image_name = mask_name.replace(MASK_SUFFIX, "")
         rel = mask_path.parent.relative_to(MASK_ROOT)
         image_path = INPUT_ROOT / rel / f"{image_name}.ims"
 
@@ -915,7 +997,7 @@ def main() -> None:
             print(f"  WARNING: matching image not found: {image_path}")
             continue
 
-        image_data, xy_spacing, z_spacing = read_ims_channels_bioio(
+        image_data, xy_spacing, z_spacing, read_mode = read_ims_channels_bioio(
             image_path,
             channel_indices=[CH_DAPI, CH_GREEN, CH_RED, CH_FARRED],
             scene_index=BIOIO_SCENE_INDEX,
@@ -928,12 +1010,15 @@ def main() -> None:
 
         print(f"  image shape CZYX: {image_data.shape}")
         print(f"  xy_spacing={xy_spacing:.4f} µm, z_spacing={z_spacing:.4f} µm")
+        print(f"  read_mode={read_mode}")
 
+        was_python_downscaled = False
         if mask_data.shape != green_channel.shape:
             image_data, scale_z, scale_y, scale_x = downscale_image_to_mask_shape(
                 image_data,
                 mask_data.shape,
             )
+            was_python_downscaled = True
 
             z_spacing = z_spacing * scale_z
             xy_spacing = xy_spacing * scale_y
@@ -991,6 +1076,8 @@ def main() -> None:
 
         props_df_data = {
             "image_name": image_name,
+            "read_mode": read_mode,
+            "was_python_downscaled": was_python_downscaled,
             "label": labels,
             "area": areas,
             "num_pixels": [p.num_pixels for p in props_green],
@@ -1172,6 +1259,8 @@ def main() -> None:
 
         records.append({
             "image_name": image_name,
+            "read_mode": read_mode,
+            "was_python_downscaled": was_python_downscaled,
             "n_masks": n_masks,
             "n_valid_masks": n_valid_masks,
             "tissue_area_um2": tissue_area_um2,
