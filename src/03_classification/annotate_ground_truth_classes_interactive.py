@@ -26,8 +26,8 @@ from skimage.transform import resize
 image_name = "1.3_P301S+PLA_BS_AT8_E2_first bottom_2026-04-22_14.32.11_FusionStitcher"
 # image_name = "64U-J9910_CHST11KO_BS_AT8_delta4_first_2026-04-23_12.32.20_FusionStitcher"
 region = "brainstem"
-mask_path = f"L:/Algernon/530/Sarah/segmentation_output_pseudo3d_260611/{region}/{image_name}_mask_3d.tif"
-image_path = f"N:/01_scientific_data/Sarah_Kralova_brain_slice_data/cellpose + far-red channel/{region}/{image_name}.ims"
+# mask_path = f"L:/Algernon/530/Sarah/segmentation_output_pseudo3d_260611/{region}/{image_name}_mask_3d.tif"
+# image_path = f"N:/01_scientific_data/Sarah_Kralova_brain_slice_data/cellpose + far-red channel/{region}/{image_name}.ims"
 
 output_csv = Path(f"../../classification/annotations/cell_point_annotations_{image_name}.csv")
 
@@ -37,36 +37,50 @@ timepoint = 0
 
 NON_BINNED_STEP = 0.152
 
-MASK_ROOT = Path(r"L:\Algernon\530\Sarah\segmentation_output_pseudo3d_260611")
+MASK_ROOT = Path(r"N:\Sarah\CHST11KO&P301S project\DAPI, 488 NeuN, 594 AT8, 647 WFA\segmentation_output_pseudo3d_260611")
 root_folder = Path(
-    r"N:\01_scientific_data\Sarah_Kralova_brain_slice_data\cellpose + far-red channel"
+    r"N:\Sarah\CHST11KO&P301S project\DAPI, 488 NeuN, 594 AT8, 647 WFA"
 )
 
 image_paths = sorted(root_folder.rglob("*.ims"))
+# print(f"Found {len(image_paths)} .ims files in {root_folder}")
+# print(image_paths)
 
 # Names for the dropdown
 image_files = {}
 regions = {}
+image_rel_dirs = {}   # NEW: stores e.g. "brainstem/CHST11KO" for mask reconstruction
 
-for ims in sorted(root_folder.rglob("*.ims")):
-    region = ims.parent.name
-    mask = MASK_ROOT / region / f"{ims.stem}_mask_3d.tif"
+for ims in image_paths:
+    # The path relative to root_folder is e.g.  brainstem/CHST11KO/stem.ims
+    rel = ims.relative_to(root_folder)
+
+    # Skip files sitting directly in root_folder (no region subfolder)
+    if len(rel.parts) < 2:
+        continue
+
+    region = rel.parts[0]           # e.g. "brainstem"
+    rel_dir = rel.parent            # e.g. PosixPath("brainstem/CHST11KO")
+
+    # Mirror the same sub-directory structure under MASK_ROOT
+    mask = MASK_ROOT / rel_dir / f"{ims.stem}_input_channel.tif"
 
     if mask.exists():
         image_files[ims.stem] = ims
         regions[ims.stem] = region
+        image_rel_dirs[ims.stem] = rel_dir
+    else:
+        print(f"  [skip] no mask found for {ims.name}  (expected: {mask})")
 
 image_names = sorted(image_files.keys())
+print(f"Found {len(image_names)} images with matching masks.")
 
-
-print(f"Found {len(image_names)} images.")
+# Use the first available image as default
+image_name = image_names[0] if image_names else None
 
 # -----------------------------
 # Load image as 3D, no MIP
 # -----------------------------
-
-
-
 
 # -----------------------------
 # Helper functions
@@ -74,24 +88,70 @@ print(f"Found {len(image_names)} images.")
 
 def load_image_and_mask(image_name):
     image_path = image_files[image_name]
-    region = regions[image_name]
 
-    mask_path = (
-        MASK_ROOT
-        / region
-        / f"{image_name}_mask_3d.tif"
-    )
+    mask_path = MASK_ROOT / image_rel_dirs[image_name] / f"{image_name}_input_channel.tif"
 
     img = BioImage(image_path)
     if img.scenes:
-        x_step = img.metadata.images[0].pixels.physical_size_x
-        if x_step is not None and np.abs(x_step - NON_BINNED_STEP) < 0.1:
-            scene_index = 2
-            print(f"  Detected non-binned image, using scene_index={scene_index}")
-        else: 
-            scene_index = 1
-            print(f"  Detected binned image, using scene_index={scene_index}")
-        img.set_scene(img.scenes[scene_index])
+        n_scenes = len(img.scenes)
+        print(f"  Image has {n_scenes} scene(s): {img.scenes}")
+
+        if n_scenes == 1:
+            img.set_scene(img.scenes[0])
+            print(f"  Single scene, using scene_index=0")
+        else:
+            chosen = None
+            for i, scene_name in enumerate(img.scenes):
+                img.set_scene(scene_name)
+                x_step = img.metadata.images[0].pixels.physical_size_x
+                print(f"  Scene {i} ({scene_name}): x_step={x_step}")
+                if x_step is not None and np.abs(x_step - NON_BINNED_STEP) >= 0.1:
+                    chosen = i
+                    break
+
+            if chosen is None:
+                chosen = n_scenes - 1
+                print(f"  WARNING: no clearly binned scene found, falling back to scene_index={chosen}")
+
+            img.set_scene(img.scenes[chosen])
+            print(f"  Selected scene_index={chosen}")
+
+    data = img.get_image_data("CZYX", T=timepoint)
+
+    green = data[green_channel]
+    red = data[red_channel]
+
+    # Downsample XY for display speed (Z is kept full to preserve z-placement of points)
+    DOWNSAMPLE_FACTOR = 4  # adjust: 2 = half size, 4 = quarter size in XY
+    if DOWNSAMPLE_FACTOR > 1:
+        from skimage.transform import downscale_local_mean
+        green = downscale_local_mean(green, (1, DOWNSAMPLE_FACTOR, DOWNSAMPLE_FACTOR)).astype(np.float32)
+        red   = downscale_local_mean(red,   (1, DOWNSAMPLE_FACTOR, DOWNSAMPLE_FACTOR)).astype(np.float32)
+
+    labels = tiff.imread(mask_path)
+    labels = np.asarray(labels)
+
+    labels = resize(
+        labels,
+        output_shape=red.shape,
+        order=0,
+        preserve_range=True,
+        anti_aliasing=False,
+    ).astype(labels.dtype)
+
+    if labels.ndim != 3:
+        raise ValueError(f"Expected a 3D mask in ZYX order, got shape {labels.shape}")
+
+    if red.shape != labels.shape:
+        raise ValueError(
+            f"Image and mask shapes do not match.\n"
+            f"Red shape: {red.shape}\n"
+            f"Mask shape: {labels.shape}"
+        )
+
+    labels = labels.astype(np.uint32)
+
+    return green, red, labels
         
     # CZYX = channels, z, y, x
     # If your data has time, T=0 selects one timepoint.
