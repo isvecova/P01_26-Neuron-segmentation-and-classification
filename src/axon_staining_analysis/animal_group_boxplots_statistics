@@ -7,19 +7,23 @@ This script reads:
 
 It:
 1. Extracts animal_id as everything before the first underscore.
-2. Detects one of these groups anywhere in the filename:
+2. Excludes any animal whose animal_id matches an entry in
+   EXCLUDE_ANIMAL_ID_TOKENS (e.g. "NC" negative-control animals) before any
+   group parsing or statistics happen.
+3. Detects one of these groups anywhere in the filename:
        WT+PLA
        WT+Cykla
        P301S+Cykla
        P301S+PLA
-3. Averages all samples/images belonging to the same animal.
-4. Uses the ANIMAL, not the image or cell, as the independent experimental unit.
-5. Produces one boxplot per metric with individual animal points.
-6. Runs:
+4. Averages all samples/images belonging to the same animal.
+5. Uses the ANIMAL, not the image or cell, as the independent experimental unit.
+6. Produces one boxplot per metric with individual animal points, each
+   labeled with its animal_id.
+7. Runs:
        - overall Kruskal-Wallis test across the four groups
        - pairwise two-sided Mann-Whitney U tests
        - Holm correction across all six pairwise comparisons
-7. Writes animal-level values and statistics to CSV files.
+8. Writes animal-level values and statistics to CSV files.
 
 Install:
     pip install numpy pandas scipy matplotlib
@@ -30,6 +34,7 @@ Run:
 
 from __future__ import annotations
 
+import re
 from itertools import combinations
 from pathlib import Path
 from typing import Dict, List
@@ -45,10 +50,10 @@ from scipy import stats
 # ============================================================
 
 INPUT_CSV = Path(
-    r"L:\Algernon\530\Sarah\puncta_analysis_260713\all_images_sample_summary.csv"
+    r"N:\Sarah\Croatia project\DAPI, 488 NeuN, 594 Synaptophysin, 647 PSD95\puncta_analysis_output_updated_1\all_images_sample_summary.csv"
 )
 OUTPUT_ROOT = Path(
-    r"L:\Algernon\530\Sarah\puncta_analysis_260713\animal_group_statistics"
+    r"N:\Sarah\Croatia project\DAPI, 488 NeuN, 594 Synaptophysin, 647 PSD95\puncta_analysis_output_updated_1\animal_group_statistics"
 )
 
 GROUP_ORDER = [
@@ -57,6 +62,20 @@ GROUP_ORDER = [
     "P301S+PLA",
     "P301S+Cykla",
 ]
+
+# Brain regions to detect and analyze separately -- mixing regions together
+# wouldn't be a meaningful comparison, so the whole statistics/plotting
+# pipeline below runs once per region.
+REGION_TOKENS = {
+    "MC": "Motor cortex",
+    "HC": "Hippocampus",
+}
+
+# Animal IDs matching any of these tokens (case-insensitive substring match
+# against animal_id, e.g. an id like "NC1" or "NC03") are dropped entirely
+# before group parsing or statistics -- e.g. negative-control animals that
+# aren't part of the four experimental groups above.
+EXCLUDE_ANIMAL_ID_TOKENS = ["NC"]
 
 # Metrics to analyze. Remove or add columns as needed.
 METRICS = [
@@ -77,6 +96,11 @@ DPI = 200
 SHOW_ALL_PAIRWISE_P_VALUES = False
 ANNOTATE_SIGNIFICANT_ONLY = True
 ALPHA = 0.05
+
+# Animal-ID point labels.
+ANNOTATE_POINTS_WITH_ANIMAL_ID = True
+POINT_LABEL_FONTSIZE = 6
+POINT_LABEL_OFFSET_POINTS = (4, 2)  # (x, y) offset in points from the marker
 
 # Reproducible horizontal jitter for individual animal points.
 RANDOM_SEED = 12345
@@ -110,6 +134,33 @@ def parse_group(file_name: str) -> str:
         raise ValueError(f"No recognized group found in filename: {file_name}")
     if len(matches) > 1:
         raise ValueError(f"Multiple groups found in filename: {file_name}: {matches}")
+
+    return matches[0]
+
+
+def parse_region(file_name: str) -> str:
+    """
+    Detect the brain region (a REGION_TOKENS key, e.g. "MC" or "HC") from
+    the filename.
+
+    Unlike parse_group (substring matching), this splits the filename into
+    whole tokens on any non-alphanumeric character and requires an EXACT
+    (case-insensitive) match -- "MC" is short enough that substring matching
+    could accidentally hit inside an unrelated word, whereas as a standalone
+    token (e.g. "..._P301S+Cykla_MC_Synapto+PSD95_...") it's unambiguous.
+    """
+    tokens = re.split(r"[^A-Za-z0-9]+", file_name)
+    tokens_upper = {t.upper() for t in tokens if t}
+
+    matches = [region for region in REGION_TOKENS if region in tokens_upper]
+
+    if len(matches) == 0:
+        raise ValueError(
+            f"No recognized region token ({list(REGION_TOKENS)}) found as a "
+            f"standalone token in filename: {file_name}"
+        )
+    if len(matches) > 1:
+        raise ValueError(f"Multiple region tokens found in filename: {file_name}: {matches}")
 
     return matches[0]
 
@@ -156,7 +207,31 @@ def prepare_animal_level_data(df: pd.DataFrame) -> pd.DataFrame:
 
     df = df.copy()
     df["animal_id"] = df["file_name"].astype(str).str.split("_", n=1).str[0]
+
+    # Drop excluded animals (e.g. negative controls) BEFORE group parsing,
+    # since their filenames may not contain any of the four group tokens
+    # and would otherwise make parse_group raise.
+    if EXCLUDE_ANIMAL_ID_TOKENS:
+        tokens_upper = [token.upper() for token in EXCLUDE_ANIMAL_ID_TOKENS]
+        exclude_mask = df["animal_id"].str.upper().apply(
+            lambda aid: any(token in aid for token in tokens_upper)
+        )
+        excluded_ids = sorted(df.loc[exclude_mask, "animal_id"].unique())
+        if excluded_ids:
+            print(
+                f"Excluding {int(exclude_mask.sum())} row(s) for animal_id(s) "
+                f"matching {EXCLUDE_ANIMAL_ID_TOKENS}: {excluded_ids}"
+            )
+        df = df.loc[~exclude_mask].reset_index(drop=True)
+
+    if df.empty:
+        raise ValueError(
+            "No rows remain after applying EXCLUDE_ANIMAL_ID_TOKENS -- check the "
+            "exclusion list against your actual animal_id values."
+        )
+
     df["group"] = df["file_name"].astype(str).apply(parse_group)
+    df["region"] = df["file_name"].astype(str).apply(parse_region)
 
     # Verify that every animal belongs to only one group.
     group_count = df.groupby("animal_id")["group"].nunique()
@@ -178,9 +253,11 @@ def prepare_animal_level_data(df: pd.DataFrame) -> pd.DataFrame:
     if not available_metrics:
         raise ValueError("None of the requested METRICS exist in the input CSV.")
 
-    # Each animal contributes one value per metric: mean across its images/samples.
+    # Each animal contributes one value per metric PER REGION: mean across
+    # that animal's images/samples for that region. An animal with both MC
+    # and HC images ends up with two separate rows here (one per region).
     animal = (
-        df.groupby(["animal_id", "group"], as_index=False)[available_metrics]
+        df.groupby(["animal_id", "group", "region"], as_index=False)[available_metrics]
         .mean(numeric_only=True)
     )
     return animal
@@ -308,13 +385,16 @@ def make_boxplot(
     overall_row: Dict,
     pairwise_rows: List[Dict],
     output_path: Path,
+    title_suffix: str = "",
 ) -> None:
     rng = np.random.default_rng(RANDOM_SEED)
 
-    data = [
-        animal.loc[animal["group"] == group, metric].dropna().to_numpy(dtype=float)
+    # Keep animal_id alongside each value so points can be labeled.
+    group_frames = [
+        animal.loc[animal["group"] == group, ["animal_id", metric]].dropna(subset=[metric])
         for group in GROUP_ORDER
     ]
+    data = [gf[metric].to_numpy(dtype=float) for gf in group_frames]
 
     fig, ax = plt.subplots(figsize=(FIGURE_WIDTH, FIGURE_HEIGHT))
 
@@ -329,19 +409,32 @@ def make_boxplot(
 
     all_y = []
 
-    for position, (group, values) in enumerate(zip(GROUP_ORDER, data), start=1):
+    for position, (group, gf) in enumerate(zip(GROUP_ORDER, group_frames), start=1):
+        values = gf[metric].to_numpy(dtype=float)
         if len(values) == 0:
             continue
 
         jitter = rng.normal(loc=0.0, scale=0.055, size=len(values))
+        x = np.full(len(values), position) + jitter
         ax.scatter(
-            np.full(len(values), position) + jitter,
+            x,
             values,
             s=35,
             alpha=0.85,
             zorder=3,
         )
         all_y.extend(values.tolist())
+
+        if ANNOTATE_POINTS_WITH_ANIMAL_ID:
+            for xi, yi, animal_id in zip(x, values, gf["animal_id"]):
+                ax.annotate(
+                    str(animal_id),
+                    (xi, yi),
+                    textcoords="offset points",
+                    xytext=POINT_LABEL_OFFSET_POINTS,
+                    fontsize=POINT_LABEL_FONTSIZE,
+                    alpha=0.8,
+                )
 
         # Show n directly under each group.
         ax.text(
@@ -358,10 +451,10 @@ def make_boxplot(
     ax.set_xticklabels(GROUP_ORDER, rotation=20, ha="right")
     ax.set_ylabel(metric.replace("_", " "))
     ax.set_title(
-        f"{metric.replace('_', ' ')}\n"
+        f"{metric.replace('_', ' ')}{title_suffix}\n"
         f"Kruskal-Wallis p={overall_row['p_value']:.3g}"
         if np.isfinite(overall_row["p_value"])
-        else f"{metric.replace('_', ' ')}\nKruskal-Wallis unavailable"
+        else f"{metric.replace('_', ' ')}{title_suffix}\nKruskal-Wallis unavailable"
     )
 
     pairwise_df = pd.DataFrame(pairwise_rows)
@@ -387,60 +480,81 @@ def main() -> None:
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 
     sample = pd.read_csv(INPUT_CSV)
-    animal = prepare_animal_level_data(sample)
-    animal.to_csv(OUTPUT_ROOT / "animal_level_means.csv", index=False)
+    animal_all_regions = prepare_animal_level_data(sample)
+    animal_all_regions.to_csv(OUTPUT_ROOT / "animal_level_means_all_regions.csv", index=False)
 
-    metrics = [
-        metric for metric in METRICS
-        if metric in animal.columns
-    ]
-
-    overall_rows = []
-    pairwise_rows_all = []
-
-    for metric in metrics:
-        _, overall_row, pairwise_rows = run_statistics(animal, metric)
-        overall_rows.append(overall_row)
-        pairwise_rows_all.extend(pairwise_rows)
-
-        make_boxplot(
-            animal,
-            metric,
-            overall_row,
-            pairwise_rows,
-            OUTPUT_ROOT / f"{metric}_boxplot.png",
+    regions_present = [r for r in REGION_TOKENS if r in animal_all_regions["region"].unique()]
+    if not regions_present:
+        raise ValueError(
+            f"None of the expected region tokens {list(REGION_TOKENS)} were found "
+            "in the data after parsing."
         )
 
-    pd.DataFrame(overall_rows).to_csv(
-        OUTPUT_ROOT / "overall_kruskal_wallis.csv",
-        index=False,
-    )
-    pd.DataFrame(pairwise_rows_all).to_csv(
-        OUTPUT_ROOT / "pairwise_mann_whitney_holm.csv",
-        index=False,
-    )
+    for region in regions_present:
+        region_label = REGION_TOKENS[region]
+        print(f"\n=== Region: {region} ({region_label}) ===")
 
-    group_summary_rows = []
-    for metric in metrics:
-        for group in GROUP_ORDER:
-            values = animal.loc[animal["group"] == group, metric].dropna()
-            group_summary_rows.append({
-                "metric": metric,
-                "group": group,
-                "n_animals": int(values.shape[0]),
-                "mean": float(values.mean()) if len(values) else np.nan,
-                "sd": float(values.std(ddof=1)) if len(values) > 1 else np.nan,
-                "median": float(values.median()) if len(values) else np.nan,
-                "q1": float(values.quantile(0.25)) if len(values) else np.nan,
-                "q3": float(values.quantile(0.75)) if len(values) else np.nan,
-            })
+        region_root = OUTPUT_ROOT / region
+        region_root.mkdir(parents=True, exist_ok=True)
 
-    pd.DataFrame(group_summary_rows).to_csv(
-        OUTPUT_ROOT / "group_descriptive_statistics.csv",
-        index=False,
-    )
+        animal = animal_all_regions.loc[animal_all_regions["region"] == region].reset_index(drop=True)
+        animal.to_csv(region_root / "animal_level_means.csv", index=False)
 
-    print(f"Animal-level data and plots saved to: {OUTPUT_ROOT}")
+        metrics = [metric for metric in METRICS if metric in animal.columns]
+
+        overall_rows = []
+        pairwise_rows_all = []
+
+        for metric in metrics:
+            _, overall_row, pairwise_rows = run_statistics(animal, metric)
+            overall_row["region"] = region
+            overall_rows.append(overall_row)
+            for row in pairwise_rows:
+                row["region"] = region
+            pairwise_rows_all.extend(pairwise_rows)
+
+            make_boxplot(
+                animal,
+                metric,
+                overall_row,
+                pairwise_rows,
+                region_root / f"{metric}_boxplot.png",
+                title_suffix=f" -- {region_label}",
+            )
+
+        pd.DataFrame(overall_rows).to_csv(
+            region_root / "overall_kruskal_wallis.csv",
+            index=False,
+        )
+        pd.DataFrame(pairwise_rows_all).to_csv(
+            region_root / "pairwise_mann_whitney_holm.csv",
+            index=False,
+        )
+
+        group_summary_rows = []
+        for metric in metrics:
+            for group in GROUP_ORDER:
+                values = animal.loc[animal["group"] == group, metric].dropna()
+                group_summary_rows.append({
+                    "metric": metric,
+                    "group": group,
+                    "region": region,
+                    "n_animals": int(values.shape[0]),
+                    "mean": float(values.mean()) if len(values) else np.nan,
+                    "sd": float(values.std(ddof=1)) if len(values) > 1 else np.nan,
+                    "median": float(values.median()) if len(values) else np.nan,
+                    "q1": float(values.quantile(0.25)) if len(values) else np.nan,
+                    "q3": float(values.quantile(0.75)) if len(values) else np.nan,
+                })
+
+        pd.DataFrame(group_summary_rows).to_csv(
+            region_root / "group_descriptive_statistics.csv",
+            index=False,
+        )
+
+        print(f"  Saved region results to: {region_root}")
+
+    print(f"\nAll animal-level data and plots saved under: {OUTPUT_ROOT}")
 
 
 if __name__ == "__main__":

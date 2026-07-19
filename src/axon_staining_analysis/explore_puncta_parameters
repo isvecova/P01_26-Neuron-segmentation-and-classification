@@ -1,90 +1,170 @@
 #!/usr/bin/env python3
 """
-Interactive puncta-parameter explorer.
+FOLLOW-UP ANALYSIS (optimized):
+Count Synaptophysin and PSD95 puncta around already segmented NeuN-positive cells.
+Updated to support Signed Distance Shells (negative values for inner shell limits).
 
-Loads one .ims image and its already-created NeuN 3D label mask, then lets you
-adjust these parameters with live sliders:
+RESUME SUPPORT:
+    If SKIP_IF_OUTPUT_EXISTS is True (default), a file is skipped when its
+    QC projection PNG (<image_stem>_puncta_QC.png) already exists in the
+    output folder -- that PNG is the last thing analyze_one_image() writes,
+    so its presence means that file completed successfully on a previous
+    run. This lets you re-run the whole batch after an interruption/crash
+    without redoing already-finished files. Set SKIP_IF_OUTPUT_EXISTS to
+    False to force reprocessing of every file (e.g. after changing
+    detection parameters).
 
-    SHELL_OUTER_UM
-    SYNAPTOPHYSIN_THRESHOLD_MULTIPLIER
-    PSD95_THRESHOLD_MULTIPLIER
-    MIN_PUNCTUM_VOLUME_UM3
-    MAX_PUNCTUM_VOLUME_UM3
-    COLOCALIZATION_MAX_DISTANCE_UM
-
-Channel order:
-    0 = DAPI
-    1 = NeuN
-    2 = Synaptophysin
-    3 = PSD95
-
-Display colors:
-    green   = segmented NeuN boundaries
-    red     = Synaptophysin-positive puncta
-    magenta = PSD95-positive puncta
-    yellow  = matched Synaptophysin–PSD95 pairs
-
-Controls:
-    - Move sliders: analysis updates live.
-    - Use the Z slider to inspect individual optical sections.
-    - Click "Save settings" to write puncta_parameters.json.
-    - The batch-analysis script can load that JSON automatically.
-
-Install:
-    pip install numpy pandas scipy scikit-image tifffile matplotlib bioio
-
-Edit the SETTINGS section, then run this script from your IDE.
+    Skipped files' per-cell/summary rows are NOT lost: at the end of the
+    run, any existing all_images_per_neun_cell.csv / all_images_sample_
+    summary.csv already in OUTPUT_ROOT (from a previous run) are loaded
+    and merged with whatever was newly processed this run (see
+    merge_with_existing_csv()). If the same file_name appears in both the
+    old CSV and this run's results, the NEW result wins (so re-running a
+    file with different parameters correctly overwrites its old row
+    rather than duplicating it).
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
+import time
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, List, Optional, Tuple
+import warnings
 
 import matplotlib.pyplot as plt
-from matplotlib.widgets import Button, Slider
 import numpy as np
 import pandas as pd
 import tifffile
 from bioio import BioImage
-from scipy.ndimage import distance_transform_edt
-from scipy.optimize import linear_sum_assignment
-from skimage import exposure, filters, measure, morphology
-
+from scipy.ndimage import distance_transform_edt, gaussian_filter
+from scipy.spatial import cKDTree
+from skimage import exposure, filters, measure, morphology, segmentation, transform
 
 # ============================================================
 # SETTINGS
 # ============================================================
 
-IMS_FILE = Path(r"D:\path\to\representative_image.ims")
-MASK_FILE = Path(r"L:\path\to\representative_image_mask_3d.tif")
+# Folder containing the original .ims files.
+INPUT_ROOT = Path(r"N:\Sarah\Croatia project\DAPI, 488 NeuN, 594 Synaptophysin, 647 PSD95")
 
-SCENE_INDEX = 2
+# Folder containing masks made by the NeuN segmentation script.
+MASK_ROOT = Path(r"N:\Sarah\Croatia project\DAPI, 488 NeuN, 594 Synaptophysin, 647 PSD95\segmentation_output_pseudo3d_260611")
+
+# Output folder for puncta analysis.
+OUTPUT_ROOT = Path(r"N:\Sarah\Croatia project\DAPI, 488 NeuN, 594 Synaptophysin, 647 PSD95\puncta_analysis_output_updated_1")
+
+# If True, skip files whose QC PNG already exists in OUTPUT_ROOT (i.e.
+# were already processed successfully). Set False to force reprocessing.
+SKIP_IF_OUTPUT_EXISTS = True
+
+PREFERRED_SCENE_INDEX = 2
+NON_BINNED_STEP = 0.152
 
 DAPI_CHANNEL = 0
 NEUN_CHANNEL = 1
 SYNAPTOPHYSIN_CHANNEL = 2
 PSD95_CHANNEL = 3
 
-BACKGROUND_SIGMA_UM = 0.8
+SKIP_NAME_TOKEN = "Overview"
+
+# --- UPDATED PARAMETERS ---
+SHELL_INNER_UM = -2.0  # Captures 2 micrometers INSIDE the cell mask boundary
+SHELL_OUTER_UM = 2.0   # Captures 2 micrometers OUTSIDE the cell mask boundary
+
+BACKGROUND_SIGMA_UM = 0.0  # 0 turns off background subtraction per your settings
 SMOOTH_SIGMA_UM = 0.15
 
-INITIAL_PARAMETERS = {
-    "SHELL_OUTER_UM": 5.0,
-    "SYNAPTOPHYSIN_THRESHOLD_MULTIPLIER": 1.0,
-    "PSD95_THRESHOLD_MULTIPLIER": 1.0,
-    "MIN_PUNCTUM_VOLUME_UM3": 0.003,
-    "MAX_PUNCTUM_VOLUME_UM3": 1.0,
-    "COLOCALIZATION_MAX_DISTANCE_UM": 0.5,
-}
+SYNAPTOPHYSIN_THRESHOLD_MULTIPLIER = 0.6
+PSD95_THRESHOLD_MULTIPLIER = 1.0
 
-OUTPUT_JSON = Path(__file__).with_name("puncta_parameters.json")
+MIN_PUNCTUM_VOLUME_UM3 = 0.1
+MAX_PUNCTUM_VOLUME_UM3 = 0.8
+
+COLOCALIZATION_MAX_DISTANCE_UM = 0.8
+# ---------------------------
+
+REMOVE_BORDER_PUNCTA = False
+SAVE_LABEL_VOLUMES = False
+
+QC_DPI = 200
+QC_MARKER_SIZE = 12
+LOAD_NEUN_INTENSITY_FOR_QC = False
 
 
 # ============================================================
-# IMAGE AND DETECTION HELPERS
+# HELPERS
 # ============================================================
+
+def find_ims_files(root: Path, skip_token: str) -> List[Path]:
+    token = skip_token.lower()
+    files = []
+    for path in root.rglob("*.ims"):
+        if token and token in path.name.lower():
+            continue
+        files.append(path)
+    return sorted(files)
+
+
+def get_voxel_size_um(image: BioImage, scene_index: int):
+    px = image.metadata.images[scene_index].pixels
+    x = float(px.physical_size_x) if px.physical_size_x is not None else np.nan
+    y = float(px.physical_size_y) if px.physical_size_y is not None else x
+    z = float(px.physical_size_z) if px.physical_size_z is not None else np.nan
+
+    if not np.isfinite(x) or not np.isfinite(y):
+        raise ValueError("Missing XY pixel size in image metadata.")
+    if not np.isfinite(z):
+        warnings.warn("Missing Z spacing in metadata. Assuming Z spacing equals XY spacing.")
+        z = x
+    return z, y, x
+
+
+def load_scene_channels(path: Path):
+    bio = BioImage(str(path))
+    print("Scenes:", len(bio.scenes))
+
+    scene_index = PREFERRED_SCENE_INDEX if len(bio.scenes) > PREFERRED_SCENE_INDEX else 0
+    if scene_index != PREFERRED_SCENE_INDEX:
+        print(f"{path.name}: only {len(bio.scenes)} scene(s); falling back to scene 0.")
+
+    bio.set_scene(bio.scenes[scene_index])
+    spacing = get_voxel_size_um(bio, scene_index)
+
+    channel_requests = [
+        ("synaptophysin", SYNAPTOPHYSIN_CHANNEL),
+        ("psd95", PSD95_CHANNEL),
+    ]
+    if LOAD_NEUN_INTENSITY_FOR_QC:
+        channel_requests.insert(0, ("neun", NEUN_CHANNEL))
+
+    channels = {}
+    for name, channel in channel_requests:
+        t0 = time.perf_counter()
+        arr = np.asarray(bio.get_image_data("ZYX", C=channel, T=0), dtype=np.float32)
+        if abs(spacing[2] - NON_BINNED_STEP) < 0.1:
+            arr = transform.downscale_local_mean(arr, (1, 2, 2)).astype(np.float32)
+        channels[name] = arr
+        print(f"  {name} loaded in {time.perf_counter() - t0:.1f}s (shape={arr.shape})")
+
+    if abs(spacing[2] - NON_BINNED_STEP) < 0.1:
+        spacing = (spacing[0], spacing[1] * 2, spacing[2] * 2)
+
+    return channels, spacing
+
+
+def resize_mask_if_needed(mask: np.ndarray, target_shape: Tuple[int, int, int], context: str) -> np.ndarray:
+    if mask.shape == target_shape:
+        return mask
+    if mask.ndim != len(target_shape):
+        raise ValueError(f"{context}: mask ndim {mask.ndim} != image ndim {len(target_shape)}.")
+    if mask.shape[0] != target_shape[0]:
+        raise ValueError(f"{context}: mask Z ({mask.shape[0]}) != image Z ({target_shape[0]}).")
+
+    print(f"{context}: mask shape {mask.shape} != image shape {target_shape}; resizing with nearest-neighbor.")
+    return transform.resize(mask, target_shape, order=0, preserve_range=True, anti_aliasing=False).astype(np.int32)
+
 
 def robust_rescale(volume: np.ndarray) -> np.ndarray:
     finite = volume[np.isfinite(volume)]
@@ -93,350 +173,510 @@ def robust_rescale(volume: np.ndarray) -> np.ndarray:
     lo, hi = np.percentile(finite, (0.2, 99.8))
     if hi <= lo:
         return np.zeros_like(volume, dtype=np.float32)
-    return exposure.rescale_intensity(
-        volume, in_range=(lo, hi), out_range=(0.0, 1.0)
-    ).astype(np.float32)
+    return exposure.rescale_intensity(volume, in_range=(lo, hi), out_range=(0.0, 1.0)).astype(np.float32)
 
 
-def get_voxel_size_um(image: BioImage) -> Tuple[float, float, float]:
-    px = image.metadata.images[0].pixels
-    x = float(px.physical_size_x) if px.physical_size_x is not None else np.nan
-    y = float(px.physical_size_y) if px.physical_size_y is not None else x
-    z = float(px.physical_size_z) if px.physical_size_z is not None else np.nan
-
-    if not np.isfinite(x) or not np.isfinite(y):
-        raise ValueError("Missing XY pixel size in image metadata.")
-    if not np.isfinite(z):
-        print("WARNING: missing Z spacing; using X spacing for Z.")
-        z = x
-    return z, y, x
+def gaussian_sigma_pixels(sigma_um: float, spacing_zyx: Tuple[float, float, float]) -> Tuple[float, float, float]:
+    return tuple(float(sigma_um / s) for s in spacing_zyx)
 
 
-def load_data():
-    bio = BioImage(str(IMS_FILE))
-    bio.set_scene(bio.scenes[SCENE_INDEX])
-    spacing = get_voxel_size_um(bio)
+def detect_puncta_3d(volume: np.ndarray, spacing_zyx: Tuple[float, float, float], threshold_multiplier: float) -> Tuple[np.ndarray, np.ndarray, float]:
+    t0 = time.perf_counter()
+    img = robust_rescale(volume)
 
-    neun = np.asarray(
-        bio.get_image_data("ZYX", C=NEUN_CHANNEL, T=0), dtype=np.float32
-    )
-    syp = np.asarray(
-        bio.get_image_data("ZYX", C=SYNAPTOPHYSIN_CHANNEL, T=0), dtype=np.float32
-    )
-    psd = np.asarray(
-        bio.get_image_data("ZYX", C=PSD95_CHANNEL, T=0), dtype=np.float32
-    )
-    mask = tifffile.imread(MASK_FILE).astype(np.int32)
-
-    if mask.shape != neun.shape:
-        raise ValueError(
-            f"Mask/image mismatch: mask={mask.shape}, image={neun.shape}. "
-            "Use the same scene and scaling as the segmentation script."
-        )
-    return neun, syp, psd, mask, spacing
-
-
-def sigma_pixels(sigma_um: float, spacing: Tuple[float, float, float]):
-    return tuple(float(sigma_um / step) for step in spacing)
-
-
-def preprocess_channel(
-    volume: np.ndarray,
-    spacing: Tuple[float, float, float],
-) -> np.ndarray:
-    image = robust_rescale(volume)
-    background = filters.gaussian(
-        image,
-        sigma=sigma_pixels(BACKGROUND_SIGMA_UM, spacing),
-        preserve_range=True,
-    )
-    enhanced = np.clip(image - background, 0, None)
+    enhanced = img.copy()
+    if BACKGROUND_SIGMA_UM > 0:
+        sigma_bg = gaussian_sigma_pixels(BACKGROUND_SIGMA_UM, spacing_zyx)
+        background = gaussian_filter(img, sigma=sigma_bg, mode="nearest", truncate=2.5, output=np.float32)
+        enhanced = img - background
+        np.maximum(enhanced, 0, out=enhanced)
 
     if SMOOTH_SIGMA_UM > 0:
-        enhanced = filters.gaussian(
-            enhanced,
-            sigma=sigma_pixels(SMOOTH_SIGMA_UM, spacing),
-            preserve_range=True,
-        )
-    return enhanced.astype(np.float32)
+        enhanced = gaussian_filter(enhanced, sigma=gaussian_sigma_pixels(SMOOTH_SIGMA_UM, spacing_zyx), mode="nearest", truncate=2.5, output=np.float32)
 
+    positive_values = enhanced[enhanced > 0]
+    if positive_values.size == 0:
+        return np.zeros_like(volume, dtype=np.int32), enhanced, np.nan
 
-def detect_from_enhanced(
-    enhanced: np.ndarray,
-    spacing: Tuple[float, float, float],
-    threshold_multiplier: float,
-    min_volume_um3: float,
-    max_volume_um3: float,
-):
-    positive = enhanced[enhanced > 0]
-    if positive.size == 0:
-        return np.zeros_like(enhanced, dtype=np.int32), np.nan
-
-    threshold = float(filters.threshold_otsu(positive) * threshold_multiplier)
+    threshold = float(filters.threshold_otsu(positive_values) * threshold_multiplier)
     binary = enhanced > threshold
-    labels = measure.label(binary, connectivity=3)
 
-    voxel_volume = float(np.prod(spacing))
-    keep = np.zeros_like(binary, dtype=bool)
+    if REMOVE_BORDER_PUNCTA:
+        binary = segmentation.clear_border(binary)
 
-    for region in measure.regionprops(labels):
-        object_volume = region.area * voxel_volume
-        if min_volume_um3 <= object_volume <= max_volume_um3:
-            keep[labels == region.label] = True
+    labels = measure.label(binary, connectivity=3).astype(np.int32, copy=False)
 
-    return measure.label(keep, connectivity=3).astype(np.int32), threshold
+    voxel_volume_um3 = float(np.prod(spacing_zyx))
+    counts = np.bincount(labels.ravel())
+    volumes_um3 = counts.astype(np.float64) * voxel_volume_um3
 
+    valid = (volumes_um3 >= MIN_PUNCTUM_VOLUME_UM3) & (volumes_um3 <= MAX_PUNCTUM_VOLUME_UM3)
+    valid[0] = False
 
-def make_union_shell(
-    neun_labels: np.ndarray,
-    spacing: Tuple[float, float, float],
-    outer_um: float,
-):
-    all_neun = neun_labels > 0
-    distance = distance_transform_edt(~all_neun, sampling=spacing)
-    return (distance > 0) & (distance <= outer_um) & (~all_neun)
+    kept_binary = valid[labels]
+    filtered = measure.label(kept_binary, connectivity=3).astype(np.int32, copy=False)
+
+    print(f"    detect_puncta_3d: {time.perf_counter() - t0:.1f}s; raw components={len(counts)-1}, kept={filtered.max()}")
+    return filtered, enhanced, threshold
 
 
-def centroid_table_in_mask(
-    labels: np.ndarray,
-    analysis_mask: np.ndarray,
-    spacing: Tuple[float, float, float],
-):
+def puncta_table_whole_image(labels: np.ndarray, spacing_zyx: Tuple[float, float, float]) -> pd.DataFrame:
     rows = []
-    shape = labels.shape
-    voxel_volume = float(np.prod(spacing))
-
+    voxel_volume_um3 = float(np.prod(spacing_zyx))
     for region in measure.regionprops(labels):
         z, y, x = region.centroid
-        zi = int(np.clip(round(z), 0, shape[0] - 1))
-        yi = int(np.clip(round(y), 0, shape[1] - 1))
-        xi = int(np.clip(round(x), 0, shape[2] - 1))
-
-        if analysis_mask[zi, yi, xi]:
-            rows.append({
-                "object_id": int(region.label),
-                "z_px": float(z),
-                "y_px": float(y),
-                "x_px": float(x),
-                "z_um": float(z * spacing[0]),
-                "y_um": float(y * spacing[1]),
-                "x_um": float(x * spacing[2]),
-                "volume_um3": float(region.area * voxel_volume),
-            })
+        rows.append({
+            "object_id": int(region.label),
+            "z_px": float(z), "y_px": float(y), "x_px": float(x),
+            "z_um": float(z * spacing_zyx[0]),
+            "y_um": float(y * spacing_zyx[1]),
+            "x_um": float(x * spacing_zyx[2]),
+            "volume_um3": float(region.area * voxel_volume_um3),
+        })
     return pd.DataFrame(rows)
 
 
-def match_pairs(syp: pd.DataFrame, psd: pd.DataFrame, max_distance_um: float):
+def assign_nearest_cell_and_shell(
+    neun_labels: np.ndarray,
+    spacing_zyx: Tuple[float, float, float],
+    shell_inner_um: float,
+    shell_outer_um: float,
+):
+    """
+    Computes a signed distance transform globally in a single pass.
+    Negative values represent space inside the cell mask.
+    Positive values represent space outside the cell mask.
+    """
+    if neun_labels.max() == 0:
+        raise ValueError("No segmented NeuN cells in this mask -- nothing to analyze.")
+
+    background_mask = neun_labels == 0
+
+    # 1. Map every voxel to its nearest cell identity globally
+    _, nearest_idx = distance_transform_edt(background_mask, sampling=spacing_zyx, return_indices=True)
+    cell_id_map = neun_labels[tuple(nearest_idx)]
+
+    # 2. Compute distances outside the cells (positive values)
+    dist_outside = distance_transform_edt(background_mask, sampling=spacing_zyx)
+
+    # 3. Compute distances inside the cells (negative values)
+    dist_inside = distance_transform_edt(~background_mask, sampling=spacing_zyx)
+
+    # Combine into a signed global distance map
+    signed_distance_um = dist_outside.astype(np.float32)
+    signed_distance_um[~background_mask] = -dist_inside[~background_mask]
+
+    # 4. Generate shell condition based on signed bounds
+    shell_mask = (signed_distance_um >= shell_inner_um) & (signed_distance_um <= shell_outer_um)
+
+    return cell_id_map, signed_distance_um, shell_mask
+
+
+def attach_cell_assignment(table: pd.DataFrame, cell_id_map: np.ndarray, shell_mask: np.ndarray) -> pd.DataFrame:
+    table = table.copy()
+    if table.empty:
+        table["cell_id"] = pd.Series(dtype=int)
+        table["in_shell"] = pd.Series(dtype=bool)
+        return table
+
+    shape = cell_id_map.shape
+    z_px = table["z_px"].round().astype(int).clip(0, shape[0] - 1).to_numpy()
+    y_px = table["y_px"].round().astype(int).clip(0, shape[1] - 1).to_numpy()
+    x_px = table["x_px"].round().astype(int).clip(0, shape[2] - 1).to_numpy()
+
+    table["cell_id"] = cell_id_map[z_px, y_px, x_px]
+    table["in_shell"] = shell_mask[z_px, y_px, x_px]
+    return table
+
+
+def match_puncta_global(syp: pd.DataFrame, psd: pd.DataFrame, max_distance_um: float) -> pd.DataFrame:
     columns = [
-        "syp_id", "psd_id", "distance_um",
-        "midpoint_z_px", "midpoint_y_px", "midpoint_x_px"
+        "synaptophysin_object_id", "psd95_object_id", "distance_um",
+        "midpoint_z_px", "midpoint_y_px", "midpoint_x_px", "cell_id",
     ]
     if syp.empty or psd.empty:
         return pd.DataFrame(columns=columns)
 
     a = syp[["z_um", "y_um", "x_um"]].to_numpy()
     b = psd[["z_um", "y_um", "x_um"]].to_numpy()
-    distances = np.sqrt(((a[:, None, :] - b[None, :, :]) ** 2).sum(axis=2))
-    rows_i, cols_j = linear_sum_assignment(distances)
 
+    tree = cKDTree(b)
+    candidate_lists = tree.query_ball_point(a, r=max_distance_um)
+
+    candidates = []
+    for i, js in enumerate(candidate_lists):
+        for j in js:
+            d = float(np.linalg.norm(a[i] - b[j]))
+            candidates.append((d, i, j))
+    candidates.sort(key=lambda t: t[0])
+
+    used_syp, used_psd = set(), set()
     rows = []
-    for i, j in zip(rows_i, cols_j):
-        d = float(distances[i, j])
-        if d <= max_distance_um:
-            rows.append({
-                "syp_id": int(syp.iloc[i]["object_id"]),
-                "psd_id": int(psd.iloc[j]["object_id"]),
-                "distance_um": d,
-                "midpoint_z_px": float((syp.iloc[i]["z_px"] + psd.iloc[j]["z_px"]) / 2),
-                "midpoint_y_px": float((syp.iloc[i]["y_px"] + psd.iloc[j]["y_px"]) / 2),
-                "midpoint_x_px": float((syp.iloc[i]["x_px"] + psd.iloc[j]["x_px"]) / 2),
-            })
+    for d, i, j in candidates:
+        if i in used_syp or j in used_psd:
+            continue
+        used_syp.add(i)
+        used_psd.add(j)
+        rows.append({
+            "synaptophysin_object_id": int(syp.iloc[i]["object_id"]),
+            "psd95_object_id": int(psd.iloc[j]["object_id"]),
+            "distance_um": d,
+            "midpoint_z_px": float((syp.iloc[i]["z_px"] + psd.iloc[j]["z_px"]) / 2),
+            "midpoint_y_px": float((syp.iloc[i]["y_px"] + psd.iloc[j]["y_px"]) / 2),
+            "midpoint_x_px": float((syp.iloc[i]["x_px"] + psd.iloc[j]["x_px"]) / 2),
+            "cell_id": int(syp.iloc[i]["cell_id"]),
+        })
     return pd.DataFrame(rows, columns=columns)
 
 
-# ============================================================
-# INTERACTIVE VIEWER
-# ============================================================
+def label_centroids_for_projection(labels: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    yy, xx = [], []
+    for region in measure.regionprops(labels):
+        _, y, x = region.centroid
+        yy.append(y)
+        xx.append(x)
+    return np.asarray(yy), np.asarray(xx)
 
-def main():
-    neun, syp_raw, psd_raw, neun_labels, spacing = load_data()
 
-    print("Preprocessing channels once...")
-    syp_enhanced = preprocess_channel(syp_raw, spacing)
-    psd_enhanced = preprocess_channel(psd_raw, spacing)
-    neun_display = robust_rescale(neun)
+def save_qc_projection(
+    out_path: Path,
+    neun_volume: Optional[np.ndarray],
+    neun_labels: np.ndarray,
+    syp_labels: np.ndarray,
+    psd_labels: np.ndarray,
+    pair_rows: pd.DataFrame,
+) -> None:
+    neun_binary_projection = np.max(neun_labels > 0, axis=0)
+    if neun_volume is None:
+        neun_projection = np.zeros(neun_binary_projection.shape, dtype=np.float32)
+    else:
+        neun_projection = robust_rescale(np.max(neun_volume, axis=0))
 
-    state: Dict[str, object] = {}
+    syp_y, syp_x = label_centroids_for_projection(syp_labels)
+    psd_y, psd_x = label_centroids_for_projection(psd_labels)
 
-    fig, ax = plt.subplots(figsize=(12, 9))
-    plt.subplots_adjust(left=0.10, right=0.98, top=0.92, bottom=0.40)
+    fig, ax = plt.subplots(figsize=(11, 11))
+    ax.imshow(neun_projection, cmap="gray")
+    ax.contour(neun_binary_projection, levels=[0.5], colors="lime", linewidths=0.8)
 
-    z0 = neun.shape[0] // 2
+    if len(syp_x):
+        ax.scatter(syp_x, syp_y, s=QC_MARKER_SIZE, facecolors="none", edgecolors="red", linewidths=0.7, label="Synaptophysin puncta")
+    if len(psd_x):
+        ax.scatter(psd_x, psd_y, s=QC_MARKER_SIZE, facecolors="none", edgecolors="magenta", linewidths=0.7, label="PSD95 puncta")
+    if not pair_rows.empty:
+        ax.scatter(pair_rows["midpoint_x_px"], pair_rows["midpoint_y_px"], s=QC_MARKER_SIZE * 1.5, marker="x", c="yellow", linewidths=0.8, label="Matched pair")
 
-    slider_specs = [
-        ("Z_SLICE", 0, neun.shape[0] - 1, z0, 1),
-        ("SHELL_OUTER_UM", 1.0, 10.0, INITIAL_PARAMETERS["SHELL_OUTER_UM"], 0.1),
-        ("SYNAPTOPHYSIN_THRESHOLD_MULTIPLIER", 0.4, 2.0,
-         INITIAL_PARAMETERS["SYNAPTOPHYSIN_THRESHOLD_MULTIPLIER"], 0.01),
-        ("PSD95_THRESHOLD_MULTIPLIER", 0.4, 2.0,
-         INITIAL_PARAMETERS["PSD95_THRESHOLD_MULTIPLIER"], 0.01),
-        ("MIN_PUNCTUM_VOLUME_UM3", 0.0005, 0.05,
-         INITIAL_PARAMETERS["MIN_PUNCTUM_VOLUME_UM3"], 0.0005),
-        ("MAX_PUNCTUM_VOLUME_UM3", 0.05, 3.0,
-         INITIAL_PARAMETERS["MAX_PUNCTUM_VOLUME_UM3"], 0.01),
-        ("COLOCALIZATION_MAX_DISTANCE_UM", 0.1, 1.5,
-         INITIAL_PARAMETERS["COLOCALIZATION_MAX_DISTANCE_UM"], 0.01),
-    ]
+    ax.set_title("QC projection: NeuN segmentation and detected positive puncta\ngreen=NeuN, red=Synaptophysin, magenta=PSD95, yellow=matched pair")
+    ax.axis("off")
+    ax.legend(loc="upper right", fontsize=8, framealpha=0.8)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=QC_DPI, bbox_inches="tight")
+    plt.close(fig)
 
-    sliders = {}
-    y = 0.34
-    for name, vmin, vmax, initial, step in slider_specs:
-        slider_ax = fig.add_axes([0.22, y, 0.68, 0.025])
-        sliders[name] = Slider(
-            slider_ax,
-            name,
-            vmin,
-            vmax,
-            valinit=initial,
-            valstep=step,
+
+def merge_with_existing_csv(new_df: pd.DataFrame, csv_path: Path) -> pd.DataFrame:
+    """Merges newly-produced rows with an existing CSV from a previous run
+    (if present), keyed on 'file_name'. Rows for a file_name present in
+    both are taken from new_df (so re-processing a file with different
+    parameters overwrites its old rows rather than duplicating them).
+    Files present only in the old CSV (i.e. skipped this run) keep their
+    old rows."""
+    if not csv_path.exists():
+        return new_df
+
+    try:
+        old_df = pd.read_csv(csv_path)
+    except Exception as exc:
+        print(f"  WARNING: could not read existing CSV {csv_path} ({exc}); "
+              "not merging, only new results will be saved.")
+        return new_df
+
+    if "file_name" not in old_df.columns:
+        print(f"  WARNING: existing CSV {csv_path} has no 'file_name' column; "
+              "not merging, only new results will be saved.")
+        return new_df
+
+    if new_df.empty:
+        return old_df
+
+    new_file_names = set(new_df["file_name"].unique())
+    old_df_kept = old_df[~old_df["file_name"].isin(new_file_names)]
+
+    merged = pd.concat([old_df_kept, new_df], ignore_index=True)
+    print(f"  Merged {len(new_df)} new row(s) with {len(old_df_kept)} kept "
+          f"row(s) from existing {csv_path.name} "
+          f"({len(old_df) - len(old_df_kept)} old row(s) replaced).")
+    return merged
+
+
+def detection_parameters_fingerprint() -> str:
+    """Hash of every setting that affects detection output. Used to detect
+    stale outputs from a PREVIOUS run with different parameters, so
+    SKIP_IF_OUTPUT_EXISTS doesn't silently skip a file whose on-disk
+    output no longer matches the current settings."""
+    relevant = {
+        "SHELL_INNER_UM": SHELL_INNER_UM,
+        "SHELL_OUTER_UM": SHELL_OUTER_UM,
+        "BACKGROUND_SIGMA_UM": BACKGROUND_SIGMA_UM,
+        "SMOOTH_SIGMA_UM": SMOOTH_SIGMA_UM,
+        "SYNAPTOPHYSIN_THRESHOLD_MULTIPLIER": SYNAPTOPHYSIN_THRESHOLD_MULTIPLIER,
+        "PSD95_THRESHOLD_MULTIPLIER": PSD95_THRESHOLD_MULTIPLIER,
+        "MIN_PUNCTUM_VOLUME_UM3": MIN_PUNCTUM_VOLUME_UM3,
+        "MAX_PUNCTUM_VOLUME_UM3": MAX_PUNCTUM_VOLUME_UM3,
+        "COLOCALIZATION_MAX_DISTANCE_UM": COLOCALIZATION_MAX_DISTANCE_UM,
+        "REMOVE_BORDER_PUNCTA": REMOVE_BORDER_PUNCTA,
+        "PREFERRED_SCENE_INDEX": PREFERRED_SCENE_INDEX,
+        "NON_BINNED_STEP": NON_BINNED_STEP,
+    }
+    encoded = json.dumps(relevant, sort_keys=True).encode("utf-8")
+    return hashlib.sha1(encoded).hexdigest()[:12]
+
+
+def params_sidecar_path(ims_path: Path, output_dir: Path) -> Path:
+    """Small JSON file recording which parameters produced this image's
+    output, written alongside the QC PNG."""
+    return output_dir / f"{ims_path.stem}_params_used.json"
+
+
+def qc_output_path(ims_path: Path, output_dir: Path) -> Path:
+    """The QC PNG path for a given image -- also used as the 'already
+    processed' marker for the skip-existing-output feature."""
+    return output_dir / f"{ims_path.stem}_puncta_QC.png"
+
+
+def analyze_one_image(ims_path: Path, mask_path: Path, output_dir: Path) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    t_start = time.perf_counter()
+    channels, spacing = load_scene_channels(ims_path)
+
+    neun_labels = tifffile.imread(mask_path).astype(np.int32)
+    expected_shape = channels["synaptophysin"].shape
+    neun_labels = resize_mask_if_needed(neun_labels, expected_shape, context=ims_path.name)
+
+    t0 = time.perf_counter()
+    syp_labels, _, syp_threshold = detect_puncta_3d(channels["synaptophysin"], spacing, SYNAPTOPHYSIN_THRESHOLD_MULTIPLIER)
+    psd_labels, _, psd_threshold = detect_puncta_3d(channels["psd95"], spacing, PSD95_THRESHOLD_MULTIPLIER)
+    print(f"  Puncta detection: {time.perf_counter() - t0:.1f}s")
+
+    t0 = time.perf_counter()
+    syp_table = puncta_table_whole_image(syp_labels, spacing)
+    psd_table = puncta_table_whole_image(psd_labels, spacing)
+    print(f"  Punctum tables ({len(syp_table)} SYP, {len(psd_table)} PSD95): {time.perf_counter() - t0:.1f}s")
+
+    t0 = time.perf_counter()
+    cell_id_map, _distance_um, shell_mask = assign_nearest_cell_and_shell(neun_labels, spacing, SHELL_INNER_UM, SHELL_OUTER_UM)
+    print(f"  Global nearest-cell/shell assignment: {time.perf_counter() - t0:.1f}s")
+
+    syp_table = attach_cell_assignment(syp_table, cell_id_map, shell_mask)
+    psd_table = attach_cell_assignment(psd_table, cell_id_map, shell_mask)
+
+    syp_in_shell = syp_table[syp_table["in_shell"]].reset_index(drop=True)
+    psd_in_shell = psd_table[psd_table["in_shell"]].reset_index(drop=True)
+
+    t0 = time.perf_counter()
+    all_pairs = match_puncta_global(syp_in_shell, psd_in_shell, COLOCALIZATION_MAX_DISTANCE_UM)
+    print(f"  Matching ({len(all_pairs)} pairs): {time.perf_counter() - t0:.1f}s")
+
+    voxel_volume_um3 = float(np.prod(spacing))
+
+    syp_counts = syp_in_shell.groupby("cell_id").size()
+    psd_counts = psd_in_shell.groupby("cell_id").size()
+    pair_counts = all_pairs.groupby("cell_id").size() if not all_pairs.empty else pd.Series(dtype=int)
+    pair_mean_distance = all_pairs.groupby("cell_id")["distance_um"].mean() if not all_pairs.empty else pd.Series(dtype=float)
+
+    shell_cell_ids = cell_id_map[shell_mask]
+    shell_voxel_counts = pd.Series(shell_cell_ids).value_counts()
+    shell_volume_um3_by_cell = shell_voxel_counts * voxel_volume_um3
+
+    per_cell_rows = []
+    for region in measure.regionprops(neun_labels):
+        cell_id = int(region.label)
+        shell_volume_um3 = float(shell_volume_um3_by_cell.get(cell_id, 0.0))
+        syp_count = int(syp_counts.get(cell_id, 0))
+        psd_count = int(psd_counts.get(cell_id, 0))
+        pairs_n = int(pair_counts.get(cell_id, 0))
+
+        per_cell_rows.append({
+            "file_name": ims_path.name,
+            "image_stem": ims_path.stem,
+            "animal_id": ims_path.stem.split("_", 1)[0],
+            "cell_id": cell_id,
+            "voxel_size_z_um": spacing[0],
+            "voxel_size_y_um": spacing[1],
+            "voxel_size_x_um": spacing[2],
+            "neun_volume_um3": float(region.area * voxel_volume_um3),
+            "shell_volume_um3": shell_volume_um3,
+            "synaptophysin_count": syp_count,
+            "psd95_count": psd_count,
+            "colocalized_pair_count": pairs_n,
+            "synaptophysin_density_per_100_um3": (100.0 * syp_count / shell_volume_um3 if shell_volume_um3 > 0 else np.nan),
+            "psd95_density_per_100_um3": (100.0 * psd_count / shell_volume_um3 if shell_volume_um3 > 0 else np.nan),
+            "colocalized_density_per_100_um3": (100.0 * pairs_n / shell_volume_um3 if shell_volume_um3 > 0 else np.nan),
+            "fraction_synaptophysin_paired": (pairs_n / syp_count if syp_count > 0 else np.nan),
+            "fraction_psd95_paired": (pairs_n / psd_count if psd_count > 0 else np.nan),
+            "mean_pair_distance_um": float(pair_mean_distance.get(cell_id, np.nan)),
+        })
+
+    per_cell = pd.DataFrame(per_cell_rows)
+
+    summary = pd.DataFrame([{
+        "file_name": ims_path.name,
+        "image_stem": ims_path.stem,
+        "animal_id": ims_path.stem.split("_", 1)[0],
+        "neun_cell_count": int(neun_labels.max()),
+        "total_synaptophysin_puncta_whole_image": int(syp_labels.max()),
+        "total_psd95_puncta_whole_image": int(psd_labels.max()),
+        "mean_synaptophysin_count_per_neun": (per_cell["synaptophysin_count"].mean() if not per_cell.empty else np.nan),
+        "mean_psd95_count_per_neun": (per_cell["psd95_count"].mean() if not per_cell.empty else np.nan),
+        "mean_colocalized_pairs_per_neun": (per_cell["colocalized_pair_count"].mean() if not per_cell.empty else np.nan),
+        "mean_synaptophysin_density_per_100_um3": (per_cell["synaptophysin_density_per_100_um3"].mean() if not per_cell.empty else np.nan),
+        "mean_psd95_density_per_100_um3": (per_cell["psd95_density_per_100_um3"].mean() if not per_cell.empty else np.nan),
+        "mean_colocalized_density_per_100_um3": (per_cell["colocalized_density_per_100_um3"].mean() if not per_cell.empty else np.nan),
+        "mean_fraction_synaptophysin_paired": (per_cell["fraction_synaptophysin_paired"].mean() if not per_cell.empty else np.nan),
+        "mean_fraction_psd95_paired": (per_cell["fraction_psd95_paired"].mean() if not per_cell.empty else np.nan),
+        "synaptophysin_threshold": syp_threshold,
+        "psd95_threshold": psd_threshold,
+    }])
+
+    if SAVE_LABEL_VOLUMES:
+        tifffile.imwrite(
+            output_dir / f"{ims_path.stem}_puncta_labels_3d.tif",
+            np.stack([neun_labels, syp_labels, psd_labels]).astype(np.uint32),
+            metadata={"axes": "CZYX", "Channel": {"Name": ["NeuN masks", "Synaptophysin puncta", "PSD95 puncta"]}},
         )
-        y -= 0.042
 
-    save_ax = fig.add_axes([0.78, 0.025, 0.18, 0.045])
-    save_button = Button(save_ax, "Save settings")
+    # Always write a matched-pairs CSV per image, even when there are zero
+    # matches, so every processed image has one consistently (previously
+    # this only wrote when all_pairs was non-empty, so images with no
+    # matches simply had no _matched_pairs.csv file at all).
+    all_pairs.to_csv(output_dir / f"{ims_path.stem}_matched_pairs.csv", index=False)
 
-    def current_parameters():
-        return {
-            "SHELL_OUTER_UM": float(sliders["SHELL_OUTER_UM"].val),
-            "SYNAPTOPHYSIN_THRESHOLD_MULTIPLIER":
-                float(sliders["SYNAPTOPHYSIN_THRESHOLD_MULTIPLIER"].val),
-            "PSD95_THRESHOLD_MULTIPLIER":
-                float(sliders["PSD95_THRESHOLD_MULTIPLIER"].val),
-            "MIN_PUNCTUM_VOLUME_UM3":
-                float(sliders["MIN_PUNCTUM_VOLUME_UM3"].val),
-            "MAX_PUNCTUM_VOLUME_UM3":
-                float(sliders["MAX_PUNCTUM_VOLUME_UM3"].val),
-            "COLOCALIZATION_MAX_DISTANCE_UM":
-                float(sliders["COLOCALIZATION_MAX_DISTANCE_UM"].val),
-        }
+    # IMPORTANT: the QC PNG is written LAST, deliberately. qc_output_path()
+    # is also the marker SKIP_IF_OUTPUT_EXISTS checks for on a resumed run.
+    # If it were written earlier (as it used to be, before label
+    # volumes/matched-pairs), an interruption partway through this
+    # function could leave the QC PNG on disk while matched_pairs.csv (or
+    # the label volume) never got written -- and a resumed run would then
+    # skip the file forever, silently missing that output. Writing it last
+    # means "QC PNG exists" reliably means "this file's outputs are
+    # complete."
+    save_qc_projection(qc_output_path(ims_path, output_dir), channels.get("neun"), neun_labels, syp_labels, psd_labels, all_pairs)
 
-    def recompute(_=None):
-        params = current_parameters()
-        z = int(sliders["Z_SLICE"].val)
+    # Written last of all, right after the QC PNG marker -- records which
+    # detection parameters produced this output, so a later run with
+    # different parameters can tell the existing output is stale instead
+    # of silently skipping it.
+    params_sidecar_path(ims_path, output_dir).write_text(
+        json.dumps({"fingerprint": detection_parameters_fingerprint()}, indent=2),
+        encoding="utf-8",
+    )
 
-        if params["MIN_PUNCTUM_VOLUME_UM3"] >= params["MAX_PUNCTUM_VOLUME_UM3"]:
-            ax.clear()
-            ax.text(
-                0.5, 0.5,
-                "MIN_PUNCTUM_VOLUME_UM3 must be smaller than MAX_PUNCTUM_VOLUME_UM3",
-                ha="center", va="center", transform=ax.transAxes,
-            )
-            fig.canvas.draw_idle()
-            return
+    print(f"  Total time for {ims_path.name}: {time.perf_counter() - t_start:.1f}s")
+    return per_cell, summary
 
-        syp_labels, syp_threshold = detect_from_enhanced(
-            syp_enhanced,
-            spacing,
-            params["SYNAPTOPHYSIN_THRESHOLD_MULTIPLIER"],
-            params["MIN_PUNCTUM_VOLUME_UM3"],
-            params["MAX_PUNCTUM_VOLUME_UM3"],
-        )
-        psd_labels, psd_threshold = detect_from_enhanced(
-            psd_enhanced,
-            spacing,
-            params["PSD95_THRESHOLD_MULTIPLIER"],
-            params["MIN_PUNCTUM_VOLUME_UM3"],
-            params["MAX_PUNCTUM_VOLUME_UM3"],
-        )
 
-        shell = make_union_shell(
-            neun_labels, spacing, params["SHELL_OUTER_UM"]
-        )
-        syp_table = centroid_table_in_mask(syp_labels, shell, spacing)
-        psd_table = centroid_table_in_mask(psd_labels, shell, spacing)
-        pairs = match_pairs(
-            syp_table,
-            psd_table,
-            params["COLOCALIZATION_MAX_DISTANCE_UM"],
-        )
+def main() -> None:
+    if not INPUT_ROOT.exists(): raise FileNotFoundError(f"INPUT_ROOT does not exist: {INPUT_ROOT}")
+    if not MASK_ROOT.exists(): raise FileNotFoundError(f"MASK_ROOT does not exist: {MASK_ROOT}")
 
-        state["syp_labels"] = syp_labels
-        state["psd_labels"] = psd_labels
-        state["pairs"] = pairs
+    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+    files = find_ims_files(INPUT_ROOT, SKIP_NAME_TOKEN)
+    if not files:
+        print("No eligible .ims files found.")
+        return
 
-        ax.clear()
-        ax.imshow(neun_display[z], cmap="gray", vmin=0, vmax=1)
+    all_cells, all_summaries, log_rows = [], [], []
+    skipped_existing_count = 0
 
-        neun_slice = neun_labels[z] > 0
-        if np.any(neun_slice):
-            ax.contour(
-                neun_slice,
-                levels=[0.5],
-                colors="lime",
-                linewidths=0.9,
-            )
+    for index, ims_path in enumerate(files, start=1):
+        relative_parent = ims_path.parent.relative_to(INPUT_ROOT)
+        mask_path = MASK_ROOT / relative_parent / f"{ims_path.stem}_mask_3d.tif"
+        output_dir = OUTPUT_ROOT / relative_parent
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Show only puncta intersecting the selected Z slice and lying in the shell.
-        syp_slice_labels = np.unique(syp_labels[z][shell[z]])
-        syp_slice_labels = syp_slice_labels[syp_slice_labels > 0]
-        for label_id in syp_slice_labels:
-            yy, xx = np.where(syp_labels[z] == label_id)
-            if len(xx):
-                ax.scatter(
-                    np.mean(xx), np.mean(yy),
-                    s=25, facecolors="none", edgecolors="red",
-                    linewidths=1.0,
-                )
+        print(f"[{index}/{len(files)}] {ims_path.name}")
 
-        psd_slice_labels = np.unique(psd_labels[z][shell[z]])
-        psd_slice_labels = psd_slice_labels[psd_slice_labels > 0]
-        for label_id in psd_slice_labels:
-            yy, xx = np.where(psd_labels[z] == label_id)
-            if len(xx):
-                ax.scatter(
-                    np.mean(xx), np.mean(yy),
-                    s=25, facecolors="none", edgecolors="magenta",
-                    linewidths=1.0,
-                )
+        # --- Skip if this file's output already exists AND was produced
+        # with the same detection parameters as this run ---
+        existing_qc = qc_output_path(ims_path, output_dir)
+        existing_params = params_sidecar_path(ims_path, output_dir)
+        current_fingerprint = detection_parameters_fingerprint()
 
-        if not pairs.empty:
-            near_z = pairs[
-                np.abs(pairs["midpoint_z_px"] - z) <= 0.75
-            ]
-            if not near_z.empty:
-                ax.scatter(
-                    near_z["midpoint_x_px"],
-                    near_z["midpoint_y_px"],
-                    s=35,
-                    marker="x",
-                    c="yellow",
-                    linewidths=1.1,
-                )
+        if SKIP_IF_OUTPUT_EXISTS and existing_qc.exists():
+            stale = True
+            if existing_params.exists():
+                try:
+                    saved_fingerprint = json.loads(existing_params.read_text(encoding="utf-8"))["fingerprint"]
+                    stale = saved_fingerprint != current_fingerprint
+                except Exception:
+                    stale = True  # unreadable sidecar -- treat as stale, reprocess to be safe
 
-        ax.set_title(
-            f"Z={z} | SYP in shell={len(syp_table)} | "
-            f"PSD95 in shell={len(psd_table)} | matched={len(pairs)}\n"
-            f"SYP threshold={syp_threshold:.4g} | PSD95 threshold={psd_threshold:.4g}"
-        )
-        ax.axis("off")
-        fig.canvas.draw_idle()
+            if not stale:
+                print(f"  SKIPPED (already processed with same parameters): {existing_qc}")
+                log_rows.append({
+                    "file_name": ims_path.name,
+                    "status": "skipped_existing",
+                    "error": None,
+                })
+                skipped_existing_count += 1
+                continue
+            else:
+                print(f"  Existing output found but parameters changed (or no record of "
+                      f"prior parameters) -- reprocessing: {ims_path.name}")
 
-    def save_settings(_event):
-        params = current_parameters()
-        params["BACKGROUND_SIGMA_UM"] = BACKGROUND_SIGMA_UM
-        params["SMOOTH_SIGMA_UM"] = SMOOTH_SIGMA_UM
-        params["SCENE_INDEX"] = SCENE_INDEX
-        OUTPUT_JSON.write_text(json.dumps(params, indent=2), encoding="utf-8")
-        print(f"Saved settings to: {OUTPUT_JSON}")
-        print(json.dumps(params, indent=2))
+        if not mask_path.exists():
+            message = f"Mask not found: {mask_path}"
+            print(f"  SKIPPED: {message}")
+            log_rows.append({"file_name": ims_path.name, "status": "skipped", "error": message})
+            continue
 
-    for slider in sliders.values():
-        slider.on_changed(recompute)
+        try:
+            per_cell, summary = analyze_one_image(ims_path, mask_path, output_dir)
+            all_cells.append(per_cell)
+            all_summaries.append(summary)
+            log_rows.append({"file_name": ims_path.name, "status": "ok", "error": None})
+            print("  Done.")
+        except Exception as exc:
+            print(f"  ERROR: {exc}")
+            log_rows.append({"file_name": ims_path.name, "status": "error", "error": str(exc)})
 
-    save_button.on_clicked(save_settings)
+        # Progressive save each iteration (crash safety). Merged with any
+        # pre-existing log so an interruption here doesn't wipe out
+        # earlier runs' entries before the final merge below.
+        merge_with_existing_csv(
+            pd.DataFrame(log_rows), OUTPUT_ROOT / "puncta_analysis_log.csv"
+        ).to_csv(OUTPUT_ROOT / "puncta_analysis_log.csv", index=False)
 
-    recompute()
-    plt.show()
+    if skipped_existing_count:
+        print(f"Skipped {skipped_existing_count} file(s) with existing output "
+              f"(SKIP_IF_OUTPUT_EXISTS={SKIP_IF_OUTPUT_EXISTS}).")
+
+    # all_cells/all_summaries only contain files processed THIS run. Merge
+    # them with any existing combined CSVs from a previous run (if
+    # present) so skipped files' rows aren't lost from the combined
+    # output -- see merge_with_existing_csv().
+    per_cell_csv = OUTPUT_ROOT / "all_images_per_neun_cell.csv"
+    summary_csv = OUTPUT_ROOT / "all_images_sample_summary.csv"
+
+    new_per_cell = pd.concat(all_cells, ignore_index=True) if all_cells else pd.DataFrame()
+    new_summary = pd.concat(all_summaries, ignore_index=True) if all_summaries else pd.DataFrame()
+
+    merged_per_cell = merge_with_existing_csv(new_per_cell, per_cell_csv)
+    merged_summary = merge_with_existing_csv(new_summary, summary_csv)
+
+    if not merged_per_cell.empty:
+        merged_per_cell.to_csv(per_cell_csv, index=False)
+    if not merged_summary.empty:
+        merged_summary.to_csv(summary_csv, index=False)
+
+    # Same merge treatment for the run log, so previously-logged files
+    # (including earlier 'ok'/'error' entries) aren't dropped either.
+    new_log = pd.DataFrame(log_rows)
+    log_csv = OUTPUT_ROOT / "puncta_analysis_log.csv"
+    merged_log = merge_with_existing_csv(new_log, log_csv)
+    if not merged_log.empty:
+        merged_log.to_csv(log_csv, index=False)
+
+    print("Finished.")
 
 
 if __name__ == "__main__":

@@ -28,7 +28,7 @@ from datetime import datetime
 # =========================
 # INPUT_ROOT = Path(r"L:\0_Service\Sarah\Croatia project")
 INPUT_ROOT = Path(r"N:\Sarah\Croatia project\DAPI, 488 NeuN, 594 Synaptophysin, 647 PSD95")
-OUTPUT_ROOT = Path(r"N:\Sarah\Croatia project\DAPI, 488 NeuN, 594 Synaptophysin, 647 PSD95")
+OUTPUT_ROOT = Path(r"N:\Sarah\Croatia project\DAPI, 488 NeuN, 594 Synaptophysin, 647 PSD9\segmentation_output_pseudo3d_260611")
 
 # Channel selection: second channel = index 1
 CHANNEL_INDEX = 1
